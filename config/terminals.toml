@@ -1,0 +1,96 @@
+# ===========================================================================
+# Terminal / router attribution registry.
+#
+# Every Solana trading terminal leaves a fingerprint in the transactions it
+# builds: its own router program, and a fee or tip account it pays on every
+# swap. Matching a buyer's transaction against this registry tells you WHO is
+# buying - a retail terminal user, a copy-trade bot, or a launch sniper - and
+# that is the difference between confirmation and adverse selection.
+#
+# HONESTY NOTE: the program IDs below are public, stable and verified. The
+# per-terminal fee accounts are NOT hardcoded, because publishing a guessed
+# address would silently mislabel every buyer and quietly poison the model.
+# Populate them yourself with:
+#
+#     alphahound discover-terminals --hours 6
+#
+# which mines recent swaps for recurring non-AMM SOL recipients, ranks them by
+# frequency, and writes candidates to state/terminal_candidates.json for you to
+# label once. Unlabeled addresses are attributed to "unknown", never guessed.
+# ===========================================================================
+
+[programs]
+# Well-known Solana programs. These are load-bearing for parsing, not for
+# attribution, so they are safe to hardcode.
+system = "11111111111111111111111111111111"
+spl_token = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+spl_token_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+associated_token = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+
+[venues]
+# Aggregators and AMMs. A buy routed directly through one of these, with no
+# terminal fee account, is either a sophisticated actor or another bot.
+jupiter_v6 = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+raydium_amm_v4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+pumpfun_bonding_curve = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# ---------------------------------------------------------------------------
+# Attribution buckets. Each terminal lists the fee/tip accounts that identify
+# it. Empty list = that terminal cannot be detected yet, and its buyers fall
+# into "unknown" rather than being silently misassigned.
+#
+# class is what the model actually consumes:
+#   retail  - a human clicking buy in a terminal. Rising share = the wave.
+#   bot     - copy-trading or sniping automation. Rising share = adversaries.
+#   neutral - direct aggregator use, unattributable.
+# ---------------------------------------------------------------------------
+
+[[terminal]]
+name = "axiom"
+class = "retail"
+fee_accounts = []
+
+[[terminal]]
+name = "photon"
+class = "retail"
+fee_accounts = []
+
+[[terminal]]
+name = "bullx"
+class = "retail"
+fee_accounts = []
+
+[[terminal]]
+name = "gmgn"
+class = "retail"
+fee_accounts = []
+
+[[terminal]]
+name = "moby"
+class = "retail"
+fee_accounts = []
+
+[[terminal]]
+name = "fomo"
+class = "retail"
+fee_accounts = []
+
+[[terminal]]
+name = "trojan"
+class = "bot"
+fee_accounts = []
+
+[[terminal]]
+name = "maestro"
+class = "bot"
+fee_accounts = []
+
+[[terminal]]
+name = "bloom"
+class = "bot"
+fee_accounts = []
+
+[[terminal]]
+name = "banana_gun"
+class = "bot"
+fee_accounts = []

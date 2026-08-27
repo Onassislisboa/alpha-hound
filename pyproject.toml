@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alphahound"
+version = "0.1.0"
+description = "Multi-chain early-signal trading bot with a self-refining scoring model"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+solana = ["solders>=0.21", "base58>=2.1"]
+evm = ["web3>=6.20", "eth-account>=0.13"]
+robinhood = ["cryptography>=42.0"]
+stream = ["websockets>=12.0"]
+all = [
+    "solders>=0.21",
+    "base58>=2.1",
+    "web3>=6.20",
+    "eth-account>=0.13",
+    "cryptography>=42.0",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+alphahound = "alphahound.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

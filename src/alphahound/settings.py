@@ -1,0 +1,215 @@
+"""Environment + strategy configuration.
+
+No pydantic, no dotenv, no yaml. A .env file is 20 lines of parsing and TOML
+reading has been in the standard library since 3.11, so the dependency would
+buy nothing but an install step.
+"""
+
+from __future__ import annotations
+
+import os
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .models import Chain
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_dotenv(path: Path | None = None, *, override: bool = False) -> None:
+    path = path or REPO_ROOT / ".env"
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key) or default)
+    except ValueError:
+        return default
+
+
+class Config:
+    """Read-only nested config with dotted lookup.
+
+    `cfg["risk.equity_usd"]` beats `cfg["risk"]["equity_usd"]` at every call
+    site, and a missing key raising here rather than three frames deeper is
+    worth the twelve lines.
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+
+    @classmethod
+    def load(cls, path: Path) -> Config:
+        with path.open("rb") as fh:
+            return cls(tomllib.load(fh))
+
+    def __getitem__(self, dotted: str) -> Any:
+        node: Any = self._data
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                raise KeyError(f"missing config key: {dotted}")
+            node = node[part]
+        return node
+
+    def get(self, dotted: str, default: Any = None) -> Any:
+        try:
+            return self[dotted]
+        except KeyError:
+            return default
+
+    def section(self, name: str) -> dict[str, Any]:
+        value = self.get(name, {})
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def raw(self) -> dict[str, Any]:
+        return self._data
+
+
+@dataclass(slots=True)
+class Settings:
+    mode: str = "paper"
+    enabled_chains: list[Chain] = field(default_factory=lambda: [Chain.SOLANA])
+    state_dir: Path = field(default_factory=lambda: REPO_ROOT / "state")
+    log_level: str = "INFO"
+
+    solana_rpc_url: str = ""
+    solana_ws_url: str = ""
+    solana_private_key: str = ""
+    jupiter_api_key: str = ""
+    pumpportal_ws_url: str = ""
+
+    evm_private_key: str = ""
+    rpc_urls: dict[Chain, str] = field(default_factory=dict)
+    zeroex_api_key: str = ""
+    rh_chain_swap_router: str = ""
+    rh_chain_quoter: str = ""
+    rh_chain_weth: str = ""
+
+    rh_api_key: str = ""
+    rh_private_key: str = ""
+
+    birdeye_api_key: str = ""
+    helius_api_key: str = ""
+    relay_webhook_url: str = ""
+
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    @property
+    def live(self) -> bool:
+        return self.mode == "live"
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        load_dotenv()
+        chains: list[Chain] = []
+        for token in (_env("ENABLED_CHAINS", "solana")).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                chains.append(Chain(token))
+            except ValueError as exc:
+                raise ValueError(
+                    f"ENABLED_CHAINS contains unknown chain {token!r}; "
+                    f"valid values: {[c.value for c in Chain]}"
+                ) from exc
+
+        state_dir = Path(_env("STATE_DIR", "state"))
+        if not state_dir.is_absolute():
+            state_dir = REPO_ROOT / state_dir
+
+        return cls(
+            mode=_env("MODE", "paper").lower(),
+            enabled_chains=chains or [Chain.SOLANA],
+            state_dir=state_dir,
+            log_level=_env("LOG_LEVEL", "INFO").upper(),
+            solana_rpc_url=_env("SOLANA_RPC_URL"),
+            solana_ws_url=_env("SOLANA_WS_URL"),
+            solana_private_key=_env("SOLANA_PRIVATE_KEY"),
+            jupiter_api_key=_env("JUPITER_API_KEY"),
+            pumpportal_ws_url=_env("PUMPPORTAL_WS_URL"),
+            evm_private_key=_env("EVM_PRIVATE_KEY"),
+            rpc_urls={
+                Chain.BNB: _env("BNB_RPC_URL"),
+                Chain.BASE: _env("BASE_RPC_URL"),
+                Chain.ROBINHOOD_CHAIN: _env("ROBINHOOD_CHAIN_RPC_URL"),
+            },
+            zeroex_api_key=_env("ZEROEX_API_KEY"),
+            rh_chain_swap_router=_env("RH_CHAIN_SWAP_ROUTER"),
+            rh_chain_quoter=_env("RH_CHAIN_QUOTER_V2"),
+            rh_chain_weth=_env("RH_CHAIN_WETH"),
+            rh_api_key=_env("RH_API_KEY"),
+            rh_private_key=_env("RH_PRIVATE_KEY"),
+            birdeye_api_key=_env("BIRDEYE_API_KEY"),
+            helius_api_key=_env("HELIUS_API_KEY"),
+            relay_webhook_url=_env("RELAY_WEBHOOK_URL"),
+            telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
+            telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
+        )
+
+    def validate(self) -> list[str]:
+        """Return blocking problems. Paper mode is permissive on purpose; live
+        mode is not, because the failure mode of a half-configured live bot is
+        a wallet, not a stack trace."""
+        problems: list[str] = []
+        if self.mode not in {"paper", "live"}:
+            problems.append(f"MODE must be paper or live, got {self.mode!r}")
+        if not self.live:
+            return problems
+
+        if Chain.SOLANA in self.enabled_chains:
+            if not self.solana_rpc_url:
+                problems.append("SOLANA_RPC_URL is required for live Solana trading")
+            if "api.mainnet-beta.solana.com" in self.solana_rpc_url:
+                problems.append(
+                    "SOLANA_RPC_URL points at the public endpoint. It will rate-limit "
+                    "you out of every trade worth making. Use a paid RPC."
+                )
+            if not self.solana_private_key:
+                problems.append("SOLANA_PRIVATE_KEY is required for live Solana trading")
+            if not self.jupiter_api_key:
+                problems.append("JUPITER_API_KEY is required (api.jup.ag/swap/v2)")
+
+        evm_chains = [c for c in self.enabled_chains if c in self.rpc_urls]
+        if evm_chains and not self.evm_private_key:
+            problems.append("EVM_PRIVATE_KEY is required for live EVM trading")
+        for chain in evm_chains:
+            if not self.rpc_urls.get(chain):
+                problems.append(f"missing RPC URL for {chain.value}")
+        if Chain.BNB in evm_chains or Chain.BASE in evm_chains:
+            if not self.zeroex_api_key:
+                problems.append("ZEROEX_API_KEY is required for BNB/Base routing")
+        if Chain.ROBINHOOD_CHAIN in evm_chains and not self.rh_chain_swap_router:
+            problems.append("RH_CHAIN_SWAP_ROUTER is required for Robinhood Chain")
+
+        if Chain.ROBINHOOD_BROKER in self.enabled_chains:
+            if not (self.rh_api_key and self.rh_private_key):
+                problems.append("RH_API_KEY and RH_PRIVATE_KEY are required")
+        return problems
+
+
+def load_strategy(path: Path | None = None) -> Config:
+    return Config.load(path or REPO_ROOT / "config" / "strategy.toml")
+
+
+def load_terminals(path: Path | None = None) -> Config:
+    return Config.load(path or REPO_ROOT / "config" / "terminals.toml")

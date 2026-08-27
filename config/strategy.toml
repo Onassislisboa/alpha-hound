@@ -1,0 +1,215 @@
+# ===========================================================================
+# alpha-hound strategy configuration
+#
+# Everything here is a tunable. The learning loop is allowed to move some of
+# these (marked [auto]) based on realized PnL; the rest are yours alone.
+# ===========================================================================
+
+[loop]
+# How often the engine re-scores the live candidate set.
+tick_seconds = 3.0
+# A candidate older than this is no longer an early signal, it is a chart.
+max_candidate_age_minutes = 180
+# Hard cap on candidates scored per tick, to bound RPC spend.
+max_candidates_per_tick = 40
+
+
+# ---------------------------------------------------------------------------
+# Hard gates. Evaluated before scoring. A veto here is absolute - no score,
+# however high, can override it. These exist because the failure modes they
+# block (rug, honeypot, no exit liquidity) are not survivable losses, they are
+# total losses, and no amount of expected value justifies them.
+# ---------------------------------------------------------------------------
+[gates]
+# When a gate's input could not be measured, the gate abstains. In live mode an
+# abstention is a veto: a gate you cannot evaluate is a risk you cannot see.
+# Flip this to true only if you have decided, on purpose, to trade blind.
+allow_unmeasured = false
+min_liquidity_usd = 15000.0
+min_holder_count = 60
+max_top10_pct = 0.55
+max_single_holder_pct = 0.20
+max_dev_holding_pct = 0.05
+# A sell quote must come back within this slippage for 1x the intended size,
+# or we treat the token as unsellable. This is the honeypot check.
+max_sell_slippage_pct = 0.12
+# Round-trip cost (in + out + fees + gas) above this leaves no room for edge.
+max_round_trip_cost_pct = 0.06
+require_mint_authority_revoked = true
+require_freeze_authority_revoked = true
+# Token-2022 transfer fee, or an EVM sell tax.
+max_transfer_tax_pct = 0.05
+# Fraction of holders that are wallets less than 24h old. High values mean the
+# holder count is manufactured.
+max_fresh_wallet_pct = 0.70
+# Fraction of supply held by wallets that bought in the launch slot. These are
+# competing bots with a lower cost basis who will exit into your buy.
+max_bundle_pct = 0.25
+
+
+# ---------------------------------------------------------------------------
+# Chart features. Deliberately simple: on a 40-minute-old token there is not
+# enough data for anything else to mean anything, and complex indicators on
+# thin data are just noise with extra steps.
+# ---------------------------------------------------------------------------
+[chart]
+candle_seconds = 60
+lookback_candles = 30
+breakout_lookback = 10
+volume_zscore_window = 20
+# Above this move in the window we are late, not early. Buying a vertical is
+# how you inherit somebody else's exit.
+parabolic_return_threshold = 1.50
+parabolic_window_candles = 5
+# Distance above VWAP where entries stop being worth their risk.
+max_vwap_deviation = 0.35
+
+
+# ---------------------------------------------------------------------------
+# The frontrun thesis, stated explicitly so it can be falsified.
+#
+# The edge is NOT sandwiching other people's pending transactions. It is being
+# early in the retail adoption curve of a token that is about to have one. The
+# measurable form of that: retail terminal inflow (Axiom, Photon, BullX,
+# Trojan, Moby, Fomo) is ACCELERATING while its absolute share of holders is
+# still LOW. High absolute share means the crowd already arrived and you are
+# the exit liquidity.
+#
+# So the level and the derivative carry opposite signs. That is the whole idea.
+# ---------------------------------------------------------------------------
+[terminals]
+# Above this share of recent buyers, the wave has already happened.
+max_retail_terminal_share = 0.45
+# Below this acceleration there is no wave forming yet.
+min_retail_terminal_share_delta_5m = 0.04
+# Sniper/copy-bot share. These are adversaries, not confirmation.
+max_sniper_bot_share = 0.35
+# Window over which buyer attribution is computed.
+attribution_window_minutes = 10
+# Cap on transactions inspected per candidate, to bound RPC spend.
+max_txs_inspected = 250
+
+
+[flow]
+min_unique_buyers_5m = 25
+min_buy_sell_ratio = 1.35
+min_net_inflow_usd_5m = 4000.0
+# Tracked wallets that we independently measured as profitable. A buy from one
+# is the single highest-information feature available, so it is capped rather
+# than trusted blindly.
+smart_money_weight_cap = 0.30
+
+
+# ---------------------------------------------------------------------------
+# Scoring. A logistic model over normalized features. Weights live in
+# state/weights.json and are updated by the learning loop.
+# ---------------------------------------------------------------------------
+[scoring]
+# Minimum modeled win probability to consider a trade.
+min_probability = 0.56
+# Minimum expected value, as a fraction of position size, AFTER subtracting
+# every cost we can predict. A positive score with negative EV is a losing
+# trade with good self-esteem.
+min_expected_value = 0.035
+# Until this many closed trades exist, the model has no opinion worth acting
+# on and every feature contributes at its prior weight.
+min_trades_for_learned_weights = 40
+# How far a WINNING trade is assumed to run, as [ladder_rung, weight], used
+# only for the expected-value prior until real trades replace it. Most winners
+# stop at the first rung; assuming they all reach the last one would inflate
+# prior EV roughly threefold and let the bot enter anything on day one.
+prior_winner_ladder_reach = [[1, 0.60], [2, 0.25], [3, 0.15]]
+
+
+# ---------------------------------------------------------------------------
+# Risk. The only part of this system that reliably makes money is the part
+# that stops it from losing.
+# ---------------------------------------------------------------------------
+[risk]
+# Total capital the bot is allowed to see, in USD.
+equity_usd = 1000.0
+# Fraction of equity per position, before Kelly scaling.
+max_position_pct = 0.05
+min_position_usd = 15.0
+max_concurrent_positions = 4
+# Hard cap on size as a fraction of pool liquidity. This binds long before the
+# equity cap does on a small pool, and it is the difference between a position
+# you can exit and a position you are.
+max_position_pct_of_liquidity = 0.010
+max_positions_per_chain = 3
+# Fractional Kelly. Full Kelly is correct only if your probabilities are
+# correct, and yours are not.
+kelly_fraction = 0.25
+# Realized loss in a single day that halts trading until manually resumed.
+daily_loss_limit_pct = 0.12
+# Consecutive losses that trigger a cooldown.
+consecutive_loss_limit = 4
+cooldown_minutes_base = 15
+cooldown_backoff_multiplier = 2.0
+# Two tokens from the same deployer, or the same launch cohort, are one bet.
+max_exposure_per_deployer_pct = 0.06
+
+
+# ---------------------------------------------------------------------------
+# Exits. Entry gets the attention; exits get the money.
+# ---------------------------------------------------------------------------
+[exits]
+# Ladder of (gain_multiple, fraction_of_position_to_sell).
+take_profit_ladder = [[1.35, 0.34], [2.0, 0.33], [3.5, 0.33]]
+# Trailing stop, activated only after the first ladder rung fills. [auto]
+trailing_stop_pct = 0.22
+# Hard stop from entry. [auto]
+stop_loss_pct = 0.28
+# A position that has done nothing is capital with an opportunity cost.
+time_stop_minutes = 45
+# ...unless it is up at least this much, in which case let it run.
+time_stop_min_gain = 0.15
+# Emergency exit: liquidity dropped by this fraction from its peak. This
+# usually means the LP is leaving and you have seconds, not minutes.
+liquidity_drawdown_exit = 0.35
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+[execution]
+# If the price moved more than this between scoring and submitting, abort. The
+# signal was priced for a price that no longer exists.
+max_price_drift_from_signal = 0.05
+# Slippage tolerance we send to the venue.
+slippage_bps = 250
+# Solana priority fee ceiling in micro-lamports per compute unit.
+max_priority_fee_micro_lamports = 2000000
+# Retries on a failed submit. Each one costs gas and time; both are why this
+# number is small.
+max_submit_retries = 2
+confirm_timeout_seconds = 45
+# Paper mode fill model.
+paper_slippage_bps = 180
+paper_fee_bps = 75
+
+
+# ---------------------------------------------------------------------------
+# Learning. See docs/LEARNING.md for what each error class does.
+# ---------------------------------------------------------------------------
+[learning]
+enabled = true
+# Learning rate for the online logistic update.
+learning_rate = 0.04
+# L2 pull toward the prior weights. This is what stops 12 lucky trades from
+# rewriting the model.
+l2_prior_strength = 0.10
+# A feature's weight cannot move until it has this many observations.
+min_observations_per_feature = 25
+# Retrain cadence.
+retrain_every_closed_trades = 10
+# Champion/challenger: a new weight set must beat the incumbent on holdout
+# log-loss by this margin to be promoted.
+promotion_margin = 0.01
+# If live PnL over this many trades is worse than the previous weight set,
+# roll back automatically.
+rollback_window_trades = 20
+# Rejected candidates are shadow-tracked for this long to measure what our
+# filters cost us. Without this the model only ever learns from trades it
+# already agreed with.
+shadow_track_minutes = 60
