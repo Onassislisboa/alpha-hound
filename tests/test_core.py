@@ -12,6 +12,7 @@ Stdlib only, no fixtures, no plugins:
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -621,6 +622,54 @@ class TestBacktest(unittest.TestCase):
             -float(STRATEGY["exits.stop_loss_pct"]),
             places=9,
         )
+
+
+try:  # httpx is the one non-stdlib dependency; the rest of this file needs none.
+    from alphahound.providers import Dexscreener
+except ImportError:  # pragma: no cover
+    Dexscreener = None
+
+
+@unittest.skipUnless(Dexscreener is not None, "httpx not installed")
+class TestProviderCache(unittest.TestCase):
+    def test_one_token_asked_for_repeatedly_costs_one_request(self):
+        class FakeHttp:
+            def __init__(self):
+                self.calls = []
+
+            def limit(self, *_args, **_kw):
+                pass
+
+            async def get(self, url, **_kw):
+                self.calls.append(url)
+                return {
+                    "pairs": [
+                        {
+                            "chainId": "solana",
+                            "baseToken": {"address": "MINT", "symbol": "X"},
+                            "priceUsd": "1.0",
+                            "liquidity": {"usd": 50_000},
+                        }
+                    ]
+                }
+
+        http = FakeHttp()
+        dex = Dexscreener(http, cache_seconds=60.0)
+
+        async def scenario():
+            # The enricher refresh, then a buy quote, then the matching sell
+            # quote - three callers, one tick, one token.
+            for _ in range(3):
+                snaps = await dex.token_pairs(["MINT"])
+                self.assertEqual(len(snaps), 1)
+                self.assertEqual(snaps[0].price_usd, 1.0)
+            await dex.token_pairs(["MINT", "OTHER"])
+
+        asyncio.run(scenario())
+        self.assertEqual(len(http.calls), 2, "a cache hit must not hit the network")
+        # The second call asks only for what it is missing.
+        self.assertIn("OTHER", http.calls[1])
+        self.assertNotIn("MINT", http.calls[1].rsplit("/", 1)[-1])
 
 
 class TestStore(unittest.TestCase):

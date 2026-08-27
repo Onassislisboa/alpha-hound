@@ -14,6 +14,7 @@ token with four holders.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,12 +111,20 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
 
 
 class Dexscreener:
-    def __init__(self, http: Http) -> None:
+    def __init__(self, http: Http, cache_seconds: float = 2.0) -> None:
         self.http = http
+        # A tick asks for the same token several times over: the enricher
+        # refreshes it, then the router quotes a buy, then it quotes the sell
+        # back. Those are the same snapshot - prices do not move inside one
+        # tick - so caching for slightly less than a tick cuts the request rate
+        # by 3-4x. Without it the free tier 429s during exactly the launches
+        # worth trading.
+        self.cache_seconds = cache_seconds
+        self._cache: dict[str, tuple[float, PairSnapshot]] = {}
         # Documented as 300 req/min for the pairs endpoints. Staying under it
         # deliberately, because being rate-limited during a launch is the one
         # moment the data is worth anything.
-        http.limit("api.dexscreener.com", rate_per_sec=4.0, burst=8)
+        http.limit("api.dexscreener.com", rate_per_sec=3.0, burst=6)
 
     async def _get(self, path: str, **kw: Any) -> Any:
         try:
@@ -128,17 +137,35 @@ class Dexscreener:
         """Best pair per token, for up to 30 tokens in one call."""
         if not addresses:
             return []
-        data = await self._get("/latest/dex/tokens/" + ",".join(addresses[:30]))
-        pairs = (data or {}).get("pairs") or []
-        best: dict[str, PairSnapshot] = {}
-        for raw in pairs:
-            snap = parse_pair(raw)
-            if snap is None or not snap.token_address:
-                continue
-            current = best.get(snap.token_address)
-            if current is None or snap.liquidity_usd > current.liquidity_usd:
-                best[snap.token_address] = snap
-        return list(best.values())
+        now = time.monotonic()
+        out: dict[str, PairSnapshot] = {}
+        missing: list[str] = []
+        for address in addresses[:30]:
+            cached = self._cache.get(address)
+            if cached is not None and now - cached[0] < self.cache_seconds:
+                out[address] = cached[1]
+            else:
+                missing.append(address)
+
+        if missing:
+            data = await self._get("/latest/dex/tokens/" + ",".join(missing))
+            for raw in (data or {}).get("pairs") or []:
+                snap = parse_pair(raw)
+                if snap is None or not snap.token_address:
+                    continue
+                current = out.get(snap.token_address)
+                if current is None or snap.liquidity_usd > current.liquidity_usd:
+                    out[snap.token_address] = snap
+            for address in missing:
+                snap = out.get(address)
+                if snap is not None:
+                    self._cache[address] = (now, snap)
+
+        if len(self._cache) > 1024:
+            self._cache = {
+                k: v for k, v in self._cache.items() if now - v[0] < self.cache_seconds
+            }
+        return list(out.values())
 
     async def search(self, query: str) -> list[PairSnapshot]:
         data = await self._get("/latest/dex/search", params={"q": query})

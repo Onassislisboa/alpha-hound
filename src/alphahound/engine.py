@@ -73,7 +73,10 @@ class Engine:
 
         self.store = Store(settings.state_dir)
         self.http = Http()
-        self.dex = Dexscreener(self.http)
+        self.dex = Dexscreener(
+            self.http,
+            cache_seconds=0.8 * float(self.strategy.get("loop.tick_seconds", 3.0)),
+        )
         self.helius = Helius(self.http, settings.helius_api_key)
         self.birdeye = Birdeye(self.http, settings.birdeye_api_key)
         self.solana = (
