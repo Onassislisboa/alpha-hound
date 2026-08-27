@@ -17,6 +17,10 @@ from .models import Chain
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Good enough to make the on-chain features exist while paper trading, and
+# rejected outright for live trading by Settings.validate().
+PUBLIC_SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+
 
 def load_dotenv(path: Path | None = None, *, override: bool = False) -> None:
     path = path or REPO_ROOT / ".env"
@@ -179,7 +183,7 @@ class Settings:
         if Chain.SOLANA in self.enabled_chains:
             if not self.solana_rpc_url:
                 problems.append("SOLANA_RPC_URL is required for live Solana trading")
-            if "api.mainnet-beta.solana.com" in self.solana_rpc_url:
+            if PUBLIC_SOLANA_RPC in self.solana_rpc_url:
                 problems.append(
                     "SOLANA_RPC_URL points at the public endpoint. It will rate-limit "
                     "you out of every trade worth making. Use a paid RPC."

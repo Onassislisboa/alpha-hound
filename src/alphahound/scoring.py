@@ -440,6 +440,17 @@ class Scorer:
     def payoff(self) -> Payoff:
         return self._payoff
 
+    def prefilter(self, enr: Enrichment) -> list[str]:
+        """Vetoes justified by the free data alone.
+
+        Evaluated as if not live on purpose: this pass may only *reject*. In
+        live mode an unmeasured gate is a veto, which is right for the real
+        decision and wrong here - it would reject every candidate before
+        anything got measured, and the bot would never trade at all.
+        """
+        vetoes, _ = evaluate_gates(enr, self.strategy, self.store, live=False)
+        return vetoes
+
     def score(self, enr: Enrichment) -> Score:
         vetoes, abstained = evaluate_gates(enr, self.strategy, self.store, live=self.live)
         normalized = normalize(enr.features, enr.unknown)

@@ -221,6 +221,12 @@ class Decision:
     reason: str = ""
     ts_ms: int = field(default_factory=now_ms)
     weights_version: int = 0
+    # Which features were not measurable when this decision was made. Persisted
+    # because the trainer and the backtester re-normalize these stored features
+    # later, and for most normalizers a measured 0.0 is not neutral - a token
+    # with no holder data would otherwise train the model as if it had been
+    # measured and found empty.
+    unknown: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -288,6 +294,8 @@ class Position:
     trailing_active: bool = False
     decision_id: int = 0
     entry_features: Features = field(default_factory=Features)
+    # A list rather than a set so the position file stays plain JSON.
+    entry_unknown: list[str] = field(default_factory=list)
     # Price at the moment the decision was made, before execution latency. The
     # gap between this and entry_price is the late_entry error class.
     signal_price: float = 0.0
@@ -336,6 +344,9 @@ class TradeRecord:
     max_adverse_excursion: float = 0.0
     entry_slippage: float = 0.0
     notes: str = ""
+    # See Decision.unknown: the trainer must not learn from a value that was
+    # never measured.
+    unknown: set[str] = field(default_factory=set)
 
     @property
     def pnl_pct(self) -> float:

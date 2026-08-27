@@ -57,7 +57,7 @@ from alphahound.signals.terminals import (  # noqa: E402
     attribute,
     discover_fee_accounts,
 )
-from alphahound.store import Store  # noqa: E402
+from alphahound.store import Store, lock_state_dir  # noqa: E402
 
 STRATEGY = load_strategy()
 
@@ -329,6 +329,29 @@ class TestGates(unittest.TestCase):
         enr.round_trip = RoundTrip(ok=True, sell_slippage=0.60, total_cost_pct=0.02)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("sellable" in v for v in vetoes))
+
+    def test_free_data_prefilter_rejects_early_but_never_approves(self):
+        from alphahound.scoring import Model, Scorer
+        from alphahound.signals import Enricher
+
+        scorer = Scorer(Model(), STRATEGY, self.store, live=True)
+        thin = Candidate(
+            chain=Chain.SOLANA, address="mint", price_usd=1.0, liquidity_usd=900.0
+        )
+        deep = Candidate(
+            chain=Chain.SOLANA, address="mint2", price_usd=1.0, liquidity_usd=90_000.0
+        )
+        cheap_thin = Enricher.free_enrichment(thin)  # no network touched
+        cheap_deep = Enricher.free_enrichment(deep)
+
+        self.assertTrue(
+            any("liquidity" in v for v in scorer.prefilter(cheap_thin)),
+            "a pool below the floor must die before it costs an RPC call",
+        )
+        # Passing the prefilter is not approval: everything else is unmeasured,
+        # so the real (live) scoring pass still refuses it.
+        self.assertEqual(scorer.prefilter(cheap_deep), [])
+        self.assertTrue(scorer.score(cheap_deep).vetoed)
 
     def test_live_mode_vetoes_what_it_cannot_measure(self):
         enr = self.enrichment()
@@ -686,6 +709,44 @@ class TestStore(unittest.TestCase):
         loaded = self.store.trades()[0]
         self.assertAlmostEqual(loaded.features.retail_share, 0.33, places=9)
         self.assertAlmostEqual(loaded.features.axiom_share, 0.22, places=9)
+
+    def test_unmeasured_features_survive_a_round_trip_to_the_learner(self):
+        # A 0.0 that was never measured must not train the model as if it were
+        # observed: for most normalizers 0.0 is a real, non-neutral value.
+        trade = TradeRecord(
+            key="solana:mint",
+            chain=Chain.SOLANA,
+            venue=VenueId.PAPER,
+            opened_at_ms=now_ms(),
+            closed_at_ms=now_ms(),
+            entry_price=1.0,
+            exit_price=0.8,
+            size_usd=50.0,
+            pnl_usd=-10.0,
+            fees_usd=1.0,
+            exit_reason=ExitReason.STOP_LOSS,
+            error_class=ErrorClass.NO_EDGE,
+            features=Features(top10_pct=0.0, liquidity_usd=30_000.0),
+            weights_version=1,
+            unknown={"top10_pct"},
+        )
+        self.store.record_trade(trade)
+        loaded = self.store.trades()[0]
+        self.assertEqual(loaded.unknown, {"top10_pct"})
+        self.assertEqual(normalize(loaded.features, loaded.unknown)["top10_pct"], 0.0)
+        self.assertNotEqual(normalize(loaded.features)["top10_pct"], 0.0)
+
+    def test_a_second_engine_cannot_share_a_state_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            held = lock_state_dir(state)
+            try:
+                with self.assertRaises(RuntimeError):
+                    lock_state_dir(state)
+            finally:
+                held.close()
+            # Released, so a restart works without manual cleanup.
+            lock_state_dir(state).close()
 
     def test_consecutive_losses(self):
         self.store.record_trade(_trade(pnl=-10.0))

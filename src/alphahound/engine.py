@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
+from typing import IO
 
 from . import learning
 from .discovery import Discovery
@@ -36,6 +38,7 @@ from .models import (
     ExitReason,
     Features,
     Position,
+    Score,
     TradeRecord,
     VenueId,
     now_ms,
@@ -45,11 +48,17 @@ from .portfolio import ExitOrder, PositionManager
 from .providers import Birdeye, Dexscreener, Helius
 from .risk import RiskEngine
 from .scoring import Model, Scorer
-from .settings import Config, Settings, load_strategy, load_terminals
+from .settings import (
+    PUBLIC_SOLANA_RPC,
+    Config,
+    Settings,
+    load_strategy,
+    load_terminals,
+)
 from .signals import Enricher
 from .signals.solana import SolanaReader
 from .signals.terminals import TerminalRegistry
-from .store import Store, features_from_json
+from .store import Store, features_from_json, lock_state_dir
 
 log = get("engine")
 
@@ -79,9 +88,23 @@ class Engine:
         )
         self.helius = Helius(self.http, settings.helius_api_key)
         self.birdeye = Birdeye(self.http, settings.birdeye_api_key)
+        # Without an RPC the whole distribution and terminal-attribution half of
+        # the model is unmeasured, and an unmeasured feature contributes zero -
+        # so the bot would quietly score every token on aggregates alone and
+        # reject all of them, looking like it was being disciplined. In paper
+        # mode fall back to the public endpoint so the features exist; live mode
+        # refuses it outright in Settings.validate().
+        rpc = settings.solana_rpc_url
+        if not rpc and not settings.live and Chain.SOLANA in settings.enabled_chains:
+            rpc = PUBLIC_SOLANA_RPC
+            log.warning(
+                "no SOLANA_RPC_URL: falling back to the public endpoint for paper mode. "
+                "It is heavily rate-limited, so holder and attribution features will be "
+                "patchy. A paid RPC is required before live trading."
+            )
         self.solana = (
-            SolanaReader(self.http, settings.solana_rpc_url)
-            if settings.solana_rpc_url and Chain.SOLANA in settings.enabled_chains
+            SolanaReader(self.http, rpc)
+            if rpc and Chain.SOLANA in settings.enabled_chains
             else None
         )
 
@@ -107,6 +130,10 @@ class Engine:
         self.watching: dict[str, Candidate] = {}
         self._positions_path = settings.state_dir / "positions.json"
         self._closed_since_learn = 0
+        self._lock: IO[bytes] | None = None
+        self._tick_counts: Counter[str] = Counter()
+        self._best_probability = 0.0
+        self._last_heartbeat_ms = now_ms()
         self._stop = asyncio.Event()
         self._load_positions()
 
@@ -117,6 +144,11 @@ class Engine:
             for problem in problems:
                 log.error("configuration problem", extra={"problem": problem})
             raise SystemExit("refusing to start with an invalid live configuration")
+
+        try:
+            self._lock = lock_state_dir(self.settings.state_dir)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
 
         log.info(
             "starting",
@@ -135,21 +167,50 @@ class Engine:
             )
 
         await self.discovery.start()
-        tick_seconds = float(self.strategy.get("loop.tick_seconds", 3.0))
         try:
-            while not self._stop.is_set():
-                started = now_ms()
-                try:
-                    await self.tick()
-                except Exception:  # noqa: BLE001 - a bad tick must not kill the bot
-                    log.exception("tick failed")
-                elapsed = (now_ms() - started) / 1000.0
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=max(0.1, tick_seconds - elapsed)
-                    )
+            await asyncio.gather(self._risk_loop(), self._scan_loop())
         finally:
             await self.shutdown()
+
+    async def _every(self, seconds: float, body, label: str) -> None:
+        while not self._stop.is_set():
+            started = now_ms()
+            try:
+                await body()
+            except Exception:  # noqa: BLE001 - a bad pass must not kill the bot
+                log.exception(f"{label} failed")
+            elapsed = (now_ms() - started) / 1000.0
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=max(0.1, seconds - elapsed))
+
+    async def _risk_loop(self) -> None:
+        """Exits and shadow tracking, on their own schedule.
+
+        Separate from the entry scan on purpose. Enrichment latency belongs to
+        somebody else's rate limiter, and one slow candidate used to push the
+        whole loop past two minutes - during which a stop that should have
+        filled at -28% instead fills wherever the token drifted to. Opportunity
+        can wait for data; risk cannot.
+        """
+
+        async def body() -> None:
+            await self.manage_positions()
+            await self.update_shadows()
+            self._heartbeat()
+
+        await self._every(float(self.strategy.get("loop.tick_seconds", 3.0)), body, "risk pass")
+
+    async def _scan_loop(self) -> None:
+        async def body() -> None:
+            found = await self.discovery.poll()
+            for candidate in found:
+                self.watching[candidate.key] = candidate
+            self.discovery.prune()
+            self._prune_watching()
+            await self.score_and_enter()
+            await self.maybe_learn()
+
+        await self._every(float(self.strategy.get("loop.scan_seconds", 3.0)), body, "scan pass")
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -159,21 +220,37 @@ class Engine:
         await self.http.aclose()
         self._save_positions()
         self.store.close()
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
         log.info("stopped")
 
     # -- the loop ----------------------------------------------------------
-    async def tick(self) -> None:
-        await self.manage_positions()
-        await self.update_shadows()
 
-        found = await self.discovery.poll()
-        for candidate in found:
-            self.watching[candidate.key] = candidate
-        self.discovery.prune()
-        self._prune_watching()
+    def _heartbeat(self) -> None:
+        """Periodic proof of life, with the reason nothing was bought.
 
-        await self.score_and_enter()
-        await self.maybe_learn()
+        A selective bot is silent for long stretches, and silence is
+        indistinguishable from a hung loop or a dead data feed. Reporting what
+        was seen and what rejected it is the difference between "working as
+        intended" and an operator restarting a healthy process.
+        """
+        interval = float(self.strategy.get("loop.heartbeat_seconds", 60.0))
+        if interval <= 0 or now_ms() - self._last_heartbeat_ms < interval * 1000:
+            return
+        self._last_heartbeat_ms = now_ms()
+        log.info(
+            "heartbeat",
+            extra={
+                "watching": len(self.watching),
+                "open": len(self.positions),
+                "equity_usd": round(self.risk.equity(), 2),
+                "since_last": dict(self._tick_counts),
+                "best_probability": round(self._best_probability, 3),
+            },
+        )
+        self._tick_counts.clear()
+        self._best_probability = 0.0
 
     # -- positions ---------------------------------------------------------
     async def manage_positions(self) -> None:
@@ -253,6 +330,7 @@ class Engine:
             exit_reason=reason,
             error_class=ErrorClass.WIN,
             features=position.entry_features,
+            unknown=set(position.entry_unknown),
             weights_version=self.scorer.model.version,
             max_favorable_excursion=mfe,
             max_adverse_excursion=mae,
@@ -334,28 +412,69 @@ class Engine:
             self.risk.equity() * float(self.strategy.get("risk.max_position_pct", 0.05)),
         )
 
+        # The ranking goes stale as new candidates arrive, so a pass stops after
+        # its budget and lets the next one re-rank rather than working through a
+        # list that was ordered minutes ago. Unscanned candidates stay in
+        # `watching`; nothing is lost by stopping early.
+        deadline = now_ms() + int(
+            1000 * float(self.strategy.get("loop.entry_scan_budget_seconds", 20.0))
+        )
+
         for candidate in ranked:
+            if now_ms() > deadline:
+                self._tick_counts["scan_budget_spent"] += 1
+                break
             if candidate.key in self.positions:
                 continue
             if not self.router.has_venue(candidate.chain):
                 continue
+
+            cheap = self.enricher.free_enrichment(candidate)
+            free_vetoes = self.scorer.prefilter(cheap)
+            if free_vetoes:
+                self._tick_counts[f"free_veto:{free_vetoes[0].split(':')[0]}"] += 1
+                self._record(
+                    candidate,
+                    cheap.features,
+                    Score(probability=0.0, expected_value=0.0, veto_reasons=free_vetoes),
+                    Action.REJECT_GATE,
+                    0.0,
+                    free_vetoes[0],
+                    cheap.unknown,
+                )
+                continue
+
             try:
                 enrichment = await self.enricher.enrich(candidate, probe_size)
             except Exception as exc:  # noqa: BLE001
+                self._tick_counts["enrich_failed"] += 1
                 log.debug("enrich failed", extra={"key": candidate.key, "error": str(exc)})
                 continue
 
+            self._tick_counts["enriched"] += 1
             score = self.scorer.score(enrichment)
+            self._best_probability = max(self._best_probability, score.probability)
             ok, why = self.scorer.passes(score)
             if not ok:
                 action = Action.REJECT_GATE if score.vetoed else Action.REJECT_SCORE
-                self._record(candidate, enrichment.features, score, action, 0.0, why)
+                self._tick_counts[
+                    f"veto:{score.veto_reasons[0].split(':')[0]}" if score.vetoed else "low_score"
+                ] += 1
+                self._record(
+                    candidate, enrichment.features, score, action, 0.0, why, enrichment.unknown
+                )
                 continue
 
             sizing = self.risk.size(candidate, score, self.scorer.payoff, list(self.positions.values()))
             if not sizing.allowed:
                 self._record(
-                    candidate, enrichment.features, score, Action.REJECT_RISK, 0.0, sizing.reason
+                    candidate,
+                    enrichment.features,
+                    score,
+                    Action.REJECT_RISK,
+                    0.0,
+                    sizing.reason,
+                    enrichment.unknown,
                 )
                 continue
 
@@ -367,6 +486,7 @@ class Engine:
                 size_usd=sizing.size_usd,
                 reason=sizing.reason,
                 weights_version=self.scorer.model.version,
+                unknown=enrichment.unknown,
             )
             decision_id = self.store.record_decision(decision)
             await self.relay.publish(decision, sizing.size_usd, note=self.scorer.explain(score))
@@ -380,6 +500,7 @@ class Engine:
         action: Action,
         size_usd: float,
         reason: str,
+        unknown: set[str] | None = None,
     ) -> None:
         self.store.record_decision(
             Decision(
@@ -390,6 +511,7 @@ class Engine:
                 size_usd=size_usd,
                 reason=reason,
                 weights_version=self.scorer.model.version,
+                unknown=unknown or set(),
             )
         )
 
@@ -419,6 +541,7 @@ class Engine:
                     exit_reason=ExitReason.MANUAL,
                     error_class=ErrorClass.EXECUTION_FAIL,
                     features=decision.features,
+                    unknown=set(decision.unknown),
                     weights_version=decision.weights_version,
                     notes=str(exc)[:400],
                 )
@@ -439,6 +562,7 @@ class Engine:
             fees_usd=fill.fee_usd,
             decision_id=decision_id,
             entry_features=decision.features,
+            entry_unknown=sorted(decision.unknown),
             signal_price=signal_price,
         )
         self.positions[candidate.key] = position

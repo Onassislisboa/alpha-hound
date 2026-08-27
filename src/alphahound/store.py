@@ -13,9 +13,10 @@ it will just get quieter and quieter and call that discipline.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable
+from typing import IO, Any, Iterable
 
 from .models import (
     Action,
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     features TEXT NOT NULL,
     contributions TEXT NOT NULL,
     weights_version INTEGER NOT NULL,
-    reason TEXT
+    reason TEXT,
+    unknown TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_key ON decisions(key);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts_ms);
@@ -80,7 +82,8 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_slippage REAL NOT NULL,
     features TEXT NOT NULL,
     weights_version INTEGER NOT NULL,
-    notes TEXT
+    notes TEXT,
+    unknown TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at_ms);
 
@@ -139,10 +142,49 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 
+def lock_state_dir(state_dir: Path) -> IO[bytes]:
+    """Refuse to run two engines against one state directory.
+
+    Two engines sharing a wallet size positions independently, so a 5% cap
+    becomes 10% of equity, both believe they own the position, and both try to
+    exit it. An OS-level lock rather than a pidfile: the lock dies with the
+    process, so a crashed bot can restart without manual cleanup - which is
+    what a pidfile gets wrong, and it gets it wrong at 3am.
+
+    Caller keeps the handle open for the lifetime of the process.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    handle = open(state_dir / "engine.lock", "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise RuntimeError(
+            f"another alphahound engine is already running against {state_dir}"
+        ) from exc
+    return handle
+
+
 def features_from_json(payload: str) -> Features:
     data = json.loads(payload)
     known = set(Features.names())
     return Features(**{k: float(v) for k, v in data.items() if k in known})
+
+
+def unknown_from_json(payload: str | None) -> set[str]:
+    if not payload:
+        return set()
+    try:
+        return {str(name) for name in json.loads(payload)}
+    except ValueError:
+        return set()
 
 
 class Store:
@@ -154,6 +196,17 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a
+        # column added later never appears in a database that already exists.
+        for table, column, ddl in (
+            ("decisions", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
+            ("trades", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            existing = {
+                r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -163,8 +216,8 @@ class Store:
         cur = self.conn.execute(
             """INSERT INTO decisions (ts_ms, key, chain, symbol, action, probability,
                    expected_value, size_usd, signal_price, features, contributions,
-                   weights_version, reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, reason, unknown)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 decision.ts_ms,
                 decision.candidate.key,
@@ -179,6 +232,7 @@ class Store:
                 json.dumps(decision.score.contributions),
                 decision.weights_version,
                 decision.reason,
+                json.dumps(sorted(decision.unknown)),
             ),
         )
         decision_id = int(cur.lastrowid or 0)
@@ -236,8 +290,8 @@ class Store:
             """INSERT INTO trades (key, chain, venue, opened_at_ms, closed_at_ms,
                    entry_price, exit_price, signal_price, size_usd, pnl_usd, fees_usd,
                    exit_reason, error_class, mfe, mae, entry_slippage, features,
-                   weights_version, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, notes, unknown)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 trade.key,
                 trade.chain.value,
@@ -258,6 +312,7 @@ class Store:
                 json.dumps(trade.features.as_dict()),
                 trade.weights_version,
                 trade.notes,
+                json.dumps(sorted(trade.unknown)),
             ),
         )
         return int(cur.lastrowid or 0)
@@ -294,6 +349,7 @@ class Store:
             features=features_from_json(row["features"]),
             weights_version=row["weights_version"],
             notes=row["notes"] or "",
+            unknown=unknown_from_json(row["unknown"]),
         )
 
     def trade_count(self) -> int:

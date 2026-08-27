@@ -31,7 +31,7 @@ from .models import Action, Features
 from .portfolio import banked_from_peak
 from .scoring import Model, expected_value, normalize, payoff_from_history
 from .settings import Config
-from .store import Store, features_from_json
+from .store import Store, features_from_json, unknown_from_json
 
 log = get("backtest")
 
@@ -45,6 +45,7 @@ class Outcome:
     # Realized (for entries) or shadow-observed (for rejections) return.
     observed_return: float
     horizon_capped: bool
+    unknown: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -80,11 +81,12 @@ def load_outcomes(store: Store, strategy: Config) -> list[Outcome]:
                 features=trade.features,
                 observed_return=trade.pnl_pct,
                 horizon_capped=False,
+                unknown=trade.unknown,
             )
         )
 
     rows = store.conn.execute(
-        """SELECT d.key, d.symbol, d.action, d.features, s.counterfactual_pct
+        """SELECT d.key, d.symbol, d.action, d.features, d.unknown, s.counterfactual_pct
            FROM shadow s JOIN decisions d ON d.id = s.decision_id
            WHERE s.resolved = 1"""
     ).fetchall()
@@ -97,6 +99,7 @@ def load_outcomes(store: Store, strategy: Config) -> list[Outcome]:
                 features=features_from_json(row["features"]),
                 observed_return=float(row["counterfactual_pct"] or 0.0),
                 horizon_capped=True,
+                unknown=unknown_from_json(row["unknown"]),
             )
         )
     return outcomes
@@ -128,7 +131,7 @@ def evaluate(
 
     for outcome in outcomes:
         result.considered += 1
-        normalized = normalize(outcome.features)
+        normalized = normalize(outcome.features, outcome.unknown)
         probability, _ = model.probability(normalized)
         ev = expected_value(probability, payoff, outcome.features.round_trip_cost)
         if probability < min_probability or ev < min_expected_value:

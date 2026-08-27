@@ -6,12 +6,22 @@
 # ===========================================================================
 
 [loop]
-# How often the engine re-scores the live candidate set.
+# How often open positions are re-priced and exits evaluated. This loop runs
+# independently of the entry scan so a slow RPC cannot delay a stop.
 tick_seconds = 3.0
+# How often discovery runs and new candidates are scored.
+scan_seconds = 3.0
 # A candidate older than this is no longer an early signal, it is a chart.
 max_candidate_age_minutes = 180
-# Hard cap on candidates scored per tick, to bound RPC spend.
+# Hard cap on candidates fully enriched per tick, to bound RPC spend. Only
+# candidates that survive the free gates get here, so this is the real budget.
 max_candidates_per_tick = 40
+# Proof of life, with a breakdown of what rejected everything. 0 disables.
+heartbeat_seconds = 60.0
+# Wall-clock budget for one entry-scan pass, after which the candidate list is
+# re-ranked. Must be long enough to enrich at least one candidate on your RPC:
+# a public endpoint needs tens of seconds, a paid one a couple.
+entry_scan_budget_seconds = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +96,12 @@ min_retail_terminal_share_delta_5m = 0.04
 max_sniper_bot_share = 0.35
 # Window over which buyer attribution is computed.
 attribution_window_minutes = 10
-# Cap on transactions inspected per candidate, to bound RPC spend.
-max_txs_inspected = 250
+# Cap on transactions inspected per candidate, to bound RPC spend. Each one is
+# a separate getTransaction call, so this number multiplied by the candidates
+# that survive the free gates is the per-tick RPC bill. 250 x 40 candidates is
+# 10k calls per tick, which no RPC serves in three seconds and none serve
+# cheaply - hence a number that a paid endpoint can actually keep up with.
+max_txs_inspected = 60
 
 
 [flow]

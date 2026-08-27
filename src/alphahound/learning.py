@@ -406,7 +406,7 @@ def _logloss(model: Model, samples: list[tuple[dict[str, float], int, float]]) -
 def _samples_from_trades(trades: list[TradeRecord]) -> list[tuple[dict[str, float], int, float]]:
     out = []
     for trade in trades:
-        normalized = normalize(trade.features)
+        normalized = normalize(trade.features, trade.unknown)
         label = 1 if trade.won else 0
         # Magnitude matters: a +300% winner and a +3% scratch are not equally
         # informative, and unweighted logistic regression treats them as such.
@@ -550,7 +550,7 @@ def feature_report(store: Store) -> list[tuple[str, float, float, int]]:
     model = Model.load(store)
     observations: Counter[str] = Counter()
     for trade in store.trades():
-        for name, value in normalize(trade.features).items():
+        for name, value in normalize(trade.features, trade.unknown).items():
             if value != 0.0:
                 observations[name] += 1
     names = sorted(PRIOR_WEIGHTS, key=lambda n: -abs(model.weights.get(n, 0.0)))

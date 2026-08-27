@@ -100,6 +100,29 @@ class Enricher:
         candidate.symbol = candidate.symbol or snap.symbol
         return snap
 
+    @staticmethod
+    def free_enrichment(candidate: Candidate) -> Enrichment:
+        """What the last free snapshot alone can say; everything else unknown.
+
+        Used to throw a candidate out before spending RPC calls on it. The
+        liquidity gate alone rejects the large majority of new tokens and costs
+        nothing to evaluate, while a full enrichment costs one signature fetch
+        plus a transaction fetch per signature - so enriching first and gating
+        afterwards spends the entire RPC budget on tokens that were disqualified
+        by a number already in hand.
+        """
+        result = Enrichment(candidate=candidate, features=Features())
+        measured = {"liquidity_usd", "liq_to_mcap", "token_age_minutes"}
+        result.unknown.update(set(Features.names()) - measured)
+        result.features = Features(
+            liquidity_usd=candidate.liquidity_usd,
+            liq_to_mcap=(
+                candidate.liquidity_usd / candidate.mcap_usd if candidate.mcap_usd > 0 else 0.0
+            ),
+            token_age_minutes=candidate.age_minutes,
+        )
+        return result
+
     async def enrich(self, candidate: Candidate, probe_size_usd: float) -> Enrichment:
         result = Enrichment(candidate=candidate, features=Features())
         snap = await self.refresh(candidate)

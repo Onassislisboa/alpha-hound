@@ -17,10 +17,12 @@ import asyncio
 import base64
 import struct
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from ..log import get
 from ..models import Side
 from ..net import Http, gather_ok
+from ..settings import PUBLIC_SOLANA_RPC
 from .distribution import Holder
 from .flow import Trade
 from .terminals import BuyerTx
@@ -72,11 +74,27 @@ class RpcError(RuntimeError):
 
 
 class SolanaReader:
-    def __init__(self, http: Http, rpc_url: str, *, commitment: str = "confirmed") -> None:
+    def __init__(
+        self,
+        http: Http,
+        rpc_url: str,
+        *,
+        commitment: str = "confirmed",
+        rate_per_sec: float = 25.0,
+    ) -> None:
         self.http = http
         self.rpc_url = rpc_url
         self.commitment = commitment
         self._id = 0
+        # Without an explicit budget this host inherits the generous default and
+        # a single candidate's transaction fan-out will trip any rate limit,
+        # after which every retry backs off and the tick stops finishing. The
+        # public endpoint tolerates far less than this; a paid one, far more.
+        if PUBLIC_SOLANA_RPC in rpc_url:
+            rate_per_sec = 5.0
+        host = urlsplit(rpc_url).netloc
+        if host:
+            http.limit(host, rate_per_sec=rate_per_sec, burst=max(2, int(rate_per_sec)))
 
     async def _rpc(self, method: str, params: list) -> object:
         self._id += 1

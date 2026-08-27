@@ -215,7 +215,12 @@ alphahound params --history 20
 ```
 
 **3. Weight training.** Online logistic regression on realized outcomes,
-weighted by PnL magnitude, with:
+weighted by PnL magnitude. Every decision and trade persists **which features
+were unmeasurable at the time**, and the trainer neutralizes those rather than
+reading the stored `0.0` as an observation — for most of the normalizers here a
+zero is a real and non-neutral value, so training on it teaches the model that a
+token nobody could measure had no whales, no bundle, and no fresh wallets. On top
+of that:
 
 - the hand-set priors as an **L2 anchor**, so twelve lucky trades cannot rewrite the model
 - a **minimum observation count** per feature before its weight can move at all
@@ -274,6 +279,50 @@ If you are competing for the *first block* of a launch, you need the bottom two.
 This bot targets the 1–10 minute window, where analysis quality still decides the
 outcome rather than raw speed. That is a deliberate choice about where a solo
 operator can actually win.
+
+### Your RPC is the throughput ceiling
+
+Full enrichment of one Solana candidate costs roughly 90 RPC calls: the mint
+account, the largest holders and their owners, a launch-slot lookup, and one
+`getTransaction` per signature up to `terminals.max_txs_inspected`. So:
+
+| RPC | Rate | Candidates fully scored |
+|---|---|---|
+| Public `api.mainnet-beta.solana.com` | ~5/s (self-throttled) | ~1 per 2 minutes |
+| Paid (Helius, Triton, QuickNode) | 25–50/s | ~1 per 2–4 seconds |
+
+Measured on the public endpoint, not estimated. Paper mode falls back to it so
+the on-chain features exist at all, and warns that they will be patchy; holder
+distribution frequently comes back unmeasured because the fan-out gets rate
+limited. Live mode refuses the public endpoint outright. **A paid RPC is not an
+optimization here, it is the difference between scoring 30 candidates a minute
+and scoring one.**
+
+### Two loops, because risk cannot queue behind opportunity
+
+Exits run in their own loop on `loop.tick_seconds`, entry scanning in another on
+`loop.scan_seconds`. They were one loop first, and one slow candidate pushed a
+pass past two minutes — during which a stop that should have filled at −28%
+would instead fill wherever the token had drifted to. Enrichment latency belongs
+to somebody else's rate limiter, so it is never allowed on the path that closes a
+position.
+
+A `heartbeat` line every `loop.heartbeat_seconds` reports what was seen and what
+rejected it. A selective bot is silent for long stretches, and silence is
+indistinguishable from a hung loop:
+
+```json
+{"msg": "heartbeat", "watching": 23, "open": 0, "equity_usd": 1000.0,
+ "since_last": {"enriched": 1, "low_score": 1, "scan_budget_spent": 1},
+ "best_probability": 0.061}
+```
+
+### One engine per state directory
+
+Startup takes an OS-level lock on `state/`. Two engines sharing a wallet size
+positions independently, so a 5% cap silently becomes 10%, and both believe they
+own the position. The lock dies with the process, so a crash does not require
+manual cleanup before restarting.
 
 ## Commands
 
