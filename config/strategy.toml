@@ -37,8 +37,6 @@ entry_scan_budget_seconds = 20.0
 allow_unmeasured = false
 min_liquidity_usd = 15000.0
 min_holder_count = 60
-max_top10_pct = 0.55
-max_single_holder_pct = 0.20
 max_dev_holding_pct = 0.05
 # A sell quote must come back within this slippage for 1x the intended size,
 # or we treat the token as unsellable. This is the honeypot check.
@@ -55,6 +53,35 @@ max_fresh_wallet_pct = 0.70
 # Fraction of supply held by wallets that bought in the launch slot. These are
 # competing bots with a lower cost basis who will exit into your buy.
 max_bundle_pct = 0.25
+# One UNKNOWN wallet holding this much circulating supply is a rug. A known
+# KOL/whale holding the same share (the $TRUMP *shape* on a fresh launch) is
+# not vetoed — it still scores as concentrated, so size stays small.
+max_unknown_top1_pct = 0.50
+
+
+# ---------------------------------------------------------------------------
+# Origin. Per chain, only that chain's launchpad. Handmade Raydium/Pancake
+# pools are never traded — $TRUMP/$MELANIA were the *shape* of a known-KOL
+# top holder, not tokens to buy after they are old.
+# ---------------------------------------------------------------------------
+[launchpads]
+require_launchpad = true
+
+[launchpads.solana]
+# pump.fun only. Graduates keep the `pump` mint suffix even on PumpSwap.
+dex_ids = ["pumpfun", "pumpswap"]
+mint_suffixes = ["pump"]
+
+[launchpads.bnb]
+# four.meme is the pump.fun of BNB Chain. Club.fun / flaunch exist; add their
+# dex ids here if you decide the extra noise is worth it.
+dex_ids = ["fourmeme"]
+
+[launchpads.robinhood_chain]
+# Pons and Pools.trade. Graduates land on Uniswap V4, which Dexscreener labels
+# `uniswap` - on this chain that is the launchpad exit, not a stealth pool.
+# The Robinhood brokerage (majors, US app) is a different product and is off.
+dex_ids = ["pons", "pools", "uniswap"]
 
 
 # ---------------------------------------------------------------------------
@@ -108,10 +135,25 @@ max_txs_inspected = 60
 min_unique_buyers_5m = 25
 min_buy_sell_ratio = 1.35
 min_net_inflow_usd_5m = 4000.0
-# Tracked wallets that we independently measured as profitable. A buy from one
-# is the single highest-information feature available, so it is capped rather
-# than trusted blindly.
+# Tracked wallets that we independently measured as profitable, plus the KOL
+# list below. A buy from one is the single highest-information feature here.
 smart_money_weight_cap = 0.30
+# Seed KOLs / known whales. Solana addresses, case-sensitive. The bot adds to
+# this set on its own when a wallet shows up on two winning trades.
+kol_wallets = []
+
+
+# ---------------------------------------------------------------------------
+# Fomo profiles + Moby-style whales. Research only — never an execution venue.
+# Paste wallets into config/whales.toml. MobyScreener has no API; hold % and
+# buy/sell are computed from on-chain holders + recent trades.
+# ---------------------------------------------------------------------------
+[whales]
+# Unlabeled holder this large (of circulating supply) counts as a whale.
+size_pct = 0.02
+# Cope Capital elite filter when COPE_API_KEY is set.
+min_win_rate = 0.55
+min_trades = 8
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +162,11 @@ smart_money_weight_cap = 0.30
 # ---------------------------------------------------------------------------
 [scoring]
 # Minimum modeled win probability to consider a trade.
-min_probability = 0.56
+min_probability = 0.58
 # Minimum expected value, as a fraction of position size, AFTER subtracting
 # every cost we can predict. A positive score with negative EV is a losing
 # trade with good self-esteem.
-min_expected_value = 0.035
+min_expected_value = 0.04
 # Until this many closed trades exist, the model has no opinion worth acting
 # on and every feature contributes at its prior weight.
 min_trades_for_learned_weights = 40
@@ -140,17 +182,25 @@ prior_winner_ladder_reach = [[1, 0.60], [2, 0.25], [3, 0.15]]
 # that stops it from losing.
 # ---------------------------------------------------------------------------
 [risk]
-# Total capital the bot is allowed to see, in USD.
-equity_usd = 1000.0
-# Fraction of equity per position, before Kelly scaling.
-max_position_pct = 0.05
-min_position_usd = 15.0
-max_concurrent_positions = 4
+# Total capital the bot is allowed to see, in USD. Set this to the wallet
+# you will actually fund — a $100 account with this left at 1000 sizes like
+# it is rich and then cannot exit.
+equity_usd = 200.0
+# Fraction of equity per position, before Kelly scaling. Small bankroll needs
+# a larger fraction or min_position_usd is never reached.
+max_position_pct = 0.10
+min_position_usd = 10.0
+# One coin at a time. Top memecoin traders do not pyramid.
+max_concurrent_positions = 1
+max_positions_per_chain = 1
 # Hard cap on size as a fraction of pool liquidity. This binds long before the
 # equity cap does on a small pool, and it is the difference between a position
 # you can exit and a position you are.
-max_position_pct_of_liquidity = 0.010
-max_positions_per_chain = 3
+max_position_pct_of_liquidity = 0.008
+# After a close, do not bounce the same mint. One entry, one story.
+reentry_cooldown_minutes = 180
+# Few well-selected trades, not a spray.
+max_entries_per_day = 5
 # Fractional Kelly. Full Kelly is correct only if your probabilities are
 # correct, and yours are not.
 kelly_fraction = 0.25
@@ -168,19 +218,24 @@ max_exposure_per_deployer_pct = 0.06
 # Exits. Entry gets the attention; exits get the money.
 # ---------------------------------------------------------------------------
 [exits]
-# Ladder of (gain_multiple, fraction_of_position_to_sell).
-take_profit_ladder = [[1.35, 0.34], [2.0, 0.33], [3.5, 0.33]]
+# Scale out, keep a runner. Buy early, hold, sell slices on the way up —
+# not a market-dump of the whole bag at the first green candle.
+take_profit_ladder = [[1.40, 0.20], [2.20, 0.20], [3.50, 0.20]]
 # Trailing stop, activated only after the first ladder rung fills. [auto]
-trailing_stop_pct = 0.22
+trailing_stop_pct = 0.18
 # Hard stop from entry. [auto]
-stop_loss_pct = 0.28
-# A position that has done nothing is capital with an opportunity cost.
-time_stop_minutes = 45
+stop_loss_pct = 0.22
+# A dead coin is capital with an opportunity cost. A working one is allowed
+# to sit: time stop only fires if it has not moved.
+time_stop_minutes = 90
 # ...unless it is up at least this much, in which case let it run.
-time_stop_min_gain = 0.15
+time_stop_min_gain = 0.20
 # Emergency exit: liquidity dropped by this fraction from its peak. This
 # usually means the LP is leaving and you have seconds, not minutes.
 liquidity_drawdown_exit = 0.35
+# Spike died before the first take: dump this far off peak and the thesis
+# is gone. Narrower than 45% so it fires while the hard stop still would not.
+thesis_cut_from_peak = 0.28
 
 
 # ---------------------------------------------------------------------------
@@ -190,13 +245,22 @@ liquidity_drawdown_exit = 0.35
 # If the price moved more than this between scoring and submitting, abort. The
 # signal was priced for a price that no longer exists.
 max_price_drift_from_signal = 0.05
-# Slippage tolerance we send to the venue.
-slippage_bps = 250
-# Solana priority fee ceiling in micro-lamports per compute unit.
+# Base slippage. Scaled by 5m volume (thin book → more, busy book → less),
+# then bumped at most twice on a failed submit, never past max_slippage_bps.
+slippage_bps = 150
+min_slippage_bps = 80
+max_slippage_bps = 350
+slippage_volume_ref_usd = 20000.0
+retry_slippage_bump_bps = 35
+# Solana priority fee in lamports (not micro-lamports/CU). Scaled by volume,
+# bumped 1.3x per retry, hard-capped so a $10 fill cannot spend $0.20 on tips.
+priority_lamports = 80000
+max_priority_lamports = 350000
+retry_priority_mult = 1.30
+# Legacy CU ceiling kept for docs; Jupiter v2 uses priorityFeeLamports above.
 max_priority_fee_micro_lamports = 2000000
-# Retries on a failed submit. Each one costs gas and time; both are why this
-# number is small.
-max_submit_retries = 2
+# Three attempts total. Bumps stop after the second even if you raise this.
+max_submit_retries = 3
 confirm_timeout_seconds = 45
 # Paper mode fill model.
 paper_slippage_bps = 180
@@ -227,3 +291,30 @@ rollback_window_trades = 20
 # filters cost us. Without this the model only ever learns from trades it
 # already agreed with.
 shadow_track_minutes = 60
+
+
+# ---------------------------------------------------------------------------
+# Per-chain playbooks. Copy-trade only on young small launches. Robinhood
+# Chain is the hot venue: shorter window, faster first take, volume + CT.
+# Leave ENABLED_CHAINS=solana until you actually want RH fills.
+# ---------------------------------------------------------------------------
+[playbooks.solana]
+copy_max_age_minutes = 25
+copy_max_mcap_usd = 400000
+max_cluster_pct = 0.45
+
+[playbooks.bnb]
+copy_max_age_minutes = 25
+copy_max_mcap_usd = 400000
+max_cluster_pct = 0.45
+
+[playbooks.robinhood_chain]
+max_age_minutes = 50
+copy_max_age_minutes = 20
+copy_max_mcap_usd = 300000
+max_cluster_pct = 0.40
+min_volume_5m = 8000
+min_twitter_mentions = 3
+thesis_cut_from_peak = 0.22
+# Bank initials faster; this chain is moving.
+take_profit_ladder = [[1.20, 0.35], [1.80, 0.20], [3.00, 0.15]]

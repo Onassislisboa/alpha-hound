@@ -101,6 +101,7 @@ class Settings:
     pumpportal_ws_url: str = ""
 
     evm_private_key: str = ""
+    evm_keys: dict[Chain, str] = field(default_factory=dict)
     rpc_urls: dict[Chain, str] = field(default_factory=dict)
     zeroex_api_key: str = ""
     rh_chain_swap_router: str = ""
@@ -112,8 +113,9 @@ class Settings:
 
     birdeye_api_key: str = ""
     helius_api_key: str = ""
-    relay_webhook_url: str = ""
-
+    cope_api_key: str = ""
+    twitter_bearer: str = ""
+    bubblemaps_api_key: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
@@ -152,6 +154,12 @@ class Settings:
             jupiter_api_key=_env("JUPITER_API_KEY"),
             pumpportal_ws_url=_env("PUMPPORTAL_WS_URL"),
             evm_private_key=_env("EVM_PRIVATE_KEY"),
+            evm_keys={
+                Chain.BNB: _env("BNB_PRIVATE_KEY") or _env("EVM_PRIVATE_KEY"),
+                Chain.BASE: _env("BASE_PRIVATE_KEY") or _env("EVM_PRIVATE_KEY"),
+                Chain.ROBINHOOD_CHAIN: _env("ROBINHOOD_CHAIN_PRIVATE_KEY")
+                or _env("EVM_PRIVATE_KEY"),
+            },
             rpc_urls={
                 Chain.BNB: _env("BNB_RPC_URL"),
                 Chain.BASE: _env("BASE_RPC_URL"),
@@ -165,7 +173,9 @@ class Settings:
             rh_private_key=_env("RH_PRIVATE_KEY"),
             birdeye_api_key=_env("BIRDEYE_API_KEY"),
             helius_api_key=_env("HELIUS_API_KEY"),
-            relay_webhook_url=_env("RELAY_WEBHOOK_URL"),
+            cope_api_key=_env("COPE_API_KEY"),
+            twitter_bearer=_env("TWITTER_BEARER_TOKEN") or _env("X_BEARER_TOKEN"),
+            bubblemaps_api_key=_env("BUBBLEMAPS_API_KEY"),
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
         )
@@ -194,8 +204,9 @@ class Settings:
                 problems.append("JUPITER_API_KEY is required (api.jup.ag/swap/v2)")
 
         evm_chains = [c for c in self.enabled_chains if c in self.rpc_urls]
-        if evm_chains and not self.evm_private_key:
-            problems.append("EVM_PRIVATE_KEY is required for live EVM trading")
+        missing_evm = [c.value for c in evm_chains if not self.evm_key_for(c)]
+        if missing_evm:
+            problems.append(f"missing EVM private key for {', '.join(missing_evm)}")
         for chain in evm_chains:
             if not self.rpc_urls.get(chain):
                 problems.append(f"missing RPC URL for {chain.value}")
@@ -210,6 +221,33 @@ class Settings:
                 problems.append("RH_API_KEY and RH_PRIVATE_KEY are required")
         return problems
 
+    def evm_key_for(self, chain: Chain | None = None) -> str:
+        if chain is None:
+            return self.evm_private_key
+        return (self.evm_keys.get(chain) or self.evm_private_key or "").strip()
+
+    def wallet_pubkeys(self) -> dict[str, str]:
+        """Public addresses only. Never returns a secret."""
+        out: dict[str, str] = {}
+        if self.solana_private_key:
+            try:
+                from solders.keypair import Keypair
+
+                out["solana"] = str(Keypair.from_base58_string(self.solana_private_key).pubkey())
+            except Exception:  # noqa: BLE001
+                out["solana"] = "set"
+        for chain in (Chain.BNB, Chain.BASE, Chain.ROBINHOOD_CHAIN):
+            key = self.evm_key_for(chain)
+            if not key:
+                continue
+            try:
+                from eth_account import Account
+
+                out[chain.value] = Account.from_key(key).address
+            except Exception:  # noqa: BLE001
+                out[chain.value] = "set"
+        return out
+
 
 def load_strategy(path: Path | None = None) -> Config:
     return Config.load(path or REPO_ROOT / "config" / "strategy.toml")
@@ -217,3 +255,45 @@ def load_strategy(path: Path | None = None) -> Config:
 
 def load_terminals(path: Path | None = None) -> Config:
     return Config.load(path or REPO_ROOT / "config" / "terminals.toml")
+
+
+def load_whales(path: Path | None = None) -> list[dict[str, Any]]:
+    """Labeled wallets pasted from Moby / Fomo. Empty file is fine."""
+    path = path or REPO_ROOT / "config" / "whales.toml"
+    if not path.exists():
+        return []
+    with path.open("rb") as fh:
+        data = tomllib.load(fh)
+    return [dict(row) for row in (data.get("wallet") or []) if row.get("address")]
+
+
+def whale_addresses(rows: list[dict[str, Any]], *, source: str | None = None) -> set[str]:
+    out: set[str] = set()
+    for row in rows:
+        if source and str(row.get("source", "")).lower() != source:
+            continue
+        if row.get("chase", True) is False:
+            continue
+        addr = str(row.get("address") or "").strip()
+        if addr:
+            out.add(addr)
+    return out
+
+
+def crowd_addresses(rows: list[dict[str, Any]], kind: str) -> set[str]:
+    """kind='fomo' or 'whale'. chase=false wallets are known but not copied."""
+    out: set[str] = set()
+    for row in rows:
+        if row.get("chase", True) is False:
+            continue
+        addr = str(row.get("address") or "").strip()
+        if not addr:
+            continue
+        source = str(row.get("source") or "").lower()
+        klass = str(row.get("class") or "").lower()
+        is_fomo = source == "fomo" or klass == "fomo"
+        if kind == "fomo" and is_fomo:
+            out.add(addr)
+        elif kind == "whale" and not is_fomo:
+            out.add(addr)
+    return out

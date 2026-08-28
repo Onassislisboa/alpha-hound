@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 from ..log import get
 from ..models import Candidate, Candle, Chain, Features, RoundTrip, now_ms
-from ..settings import Config
+from ..origin import known_holder_share
+from ..playbook import copy_signal as copy_flag
+from ..settings import Config, crowd_addresses, whale_addresses
 from ..store import Store
-from . import chart, flow, terminals
+from . import chart, flow, terminals, whales
 from .distribution import HolderStats, analyze, holder_growth
 from .terminals import Attribution, ShareTracker, TerminalRegistry
 
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
     # Providers and the chain reader pull in httpx. They are only ever passed
     # in, never constructed here, so importing them lazily keeps the pure
     # feature maths usable without the HTTP stack installed.
-    from ..providers import Birdeye, Dexscreener, Helius, PairSnapshot
+    from ..providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, PairSnapshot, Twitter
     from .solana import MintInfo, SolanaReader
 
 log = get("signals")
@@ -51,6 +53,9 @@ class Enrichment:
     candles: list[Candle] = field(default_factory=list)
     trades: list[flow.Trade] = field(default_factory=list)
     snipers: set[str] = field(default_factory=set)
+    # Unique buy wallets in the attribution window. Fed to the smart-money
+    # learner when the position closes.
+    buyers: list[str] = field(default_factory=list)
     # Names of features that could not be measured. Gates that depend on an
     # unknown feature abstain rather than pass.
     unknown: set[str] = field(default_factory=set)
@@ -69,6 +74,10 @@ class Enricher:
         helius: Helius | None = None,
         birdeye: Birdeye | None = None,
         probe: CostProbe | None = None,
+        fomo: FomoGraph | None = None,
+        whale_rows: list | None = None,
+        twitter: Twitter | None = None,
+        bubbles: Bubblemaps | None = None,
     ) -> None:
         self.store = store
         self.strategy = strategy
@@ -78,6 +87,10 @@ class Enricher:
         self.helius = helius
         self.birdeye = birdeye
         self.probe = probe
+        self.fomo = fomo
+        self.whale_rows: list = whale_rows or []
+        self.twitter = twitter
+        self.bubbles = bubbles
 
         self.shares = ShareTracker()
         self._holder_history: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -98,6 +111,7 @@ class Enricher:
         candidate.pool_address = candidate.pool_address or snap.pair_address
         candidate.created_at_ms = candidate.created_at_ms or snap.created_at_ms
         candidate.symbol = candidate.symbol or snap.symbol
+        candidate.dex_id = candidate.dex_id or snap.dex_id
         return snap
 
     @staticmethod
@@ -112,7 +126,9 @@ class Enricher:
         by a number already in hand.
         """
         result = Enrichment(candidate=candidate, features=Features())
-        measured = {"liquidity_usd", "liq_to_mcap", "token_age_minutes"}
+        measured = {"liquidity_usd", "liq_to_mcap"}
+        if candidate.created_at_ms:
+            measured.add("token_age_minutes")
         result.unknown.update(set(Features.names()) - measured)
         result.features = Features(
             liquidity_usd=candidate.liquidity_usd,
@@ -137,10 +153,13 @@ class Enricher:
         values.update(await self._cost_features(candidate, probe_size_usd, result))
 
         values["token_age_minutes"] = candidate.age_minutes
+        if not candidate.created_at_ms:
+            result.unknown.add("token_age_minutes")
         values["liquidity_usd"] = candidate.liquidity_usd
         values["liq_to_mcap"] = (
             candidate.liquidity_usd / candidate.mcap_usd if candidate.mcap_usd > 0 else 0.0
         )
+        values.update(await self._narrative_features(candidate, result, values))
 
         known = set(Features.names())
         result.features = Features(**{k: v for k, v in values.items() if k in known})
@@ -227,7 +246,7 @@ class Enricher:
             )
         except Exception as exc:  # noqa: BLE001
             result.notes.append(f"holders failed: {exc}")
-            result.unknown.update({"top10_pct", "gini", "fresh_wallet_pct"})
+            result.unknown.update({"top10_pct", "top1_pct", "gini", "fresh_wallet_pct", "known_holder_pct"})
 
         stats = analyze(holders, now_ms=now_ms(), launch_slot=launch_slot or 0)
         result.holders = stats
@@ -286,25 +305,123 @@ class Enricher:
                 "no terminal fee accounts labeled; run `alphahound discover-terminals`"
             )
 
-        smart = self._smart_cache.get(candidate.chain)
-        if smart is None:
-            smart = self.store.smart_wallets(candidate.chain)
-            self._smart_cache[candidate.chain] = smart
+        smart = self._known_wallets(candidate.chain)
         values.update(flow.extract(trades, now_ms(), smart=smart))
+        bought: dict[str, float] = {}
+        for t in trades:
+            if t.wallet and t.side is flow.Side.BUY:
+                bought[t.wallet] = bought.get(t.wallet, 0.0) + t.size_usd
+        result.buyers = sorted(bought, key=bought.get, reverse=True)[:12]
 
         values.update(
             {
                 "holder_count": float(stats.holder_count),
                 "top10_pct": stats.top10_pct,
+                "top1_pct": stats.top1_pct,
                 "gini": stats.gini,
                 "fresh_wallet_pct": stats.fresh_wallet_pct,
                 "bundle_pct": stats.bundle_pct,
                 "dev_holding_pct": stats.dev_holding_pct,
                 "lp_locked_pct": stats.burned_pct,
+                "known_holder_pct": known_holder_share(holders, smart),
             }
         )
         values.setdefault("holder_growth_5m", 0.0)
+        if "top10_pct" not in result.unknown:
+            values.update(await self._crowd_features(candidate, holders, trades, result))
+        else:
+            result.unknown.update(
+                {"fomo_inside", "fomo_net_flow", "whale_hold_pct", "whale_net_flow"}
+            )
         return values
+
+    def _known_wallets(self, chain: Chain) -> set[str]:
+        cached = self._smart_cache.get(chain)
+        if cached is not None:
+            return cached
+        seeded = {str(a) for a in (self.strategy.get("flow.kol_wallets") or []) if a}
+        known = self.store.smart_wallets(chain) | seeded | whale_addresses(self.whale_rows)
+        self._smart_cache[chain] = known
+        return known
+
+    async def _crowd_features(
+        self,
+        candidate: Candidate,
+        holders: list,
+        trades: list[flow.Trade],
+        result: Enrichment,
+    ) -> dict[str, float]:
+        values: dict[str, float] = {}
+        fomo_set = crowd_addresses(self.whale_rows, "fomo")
+        if self.fomo and self.fomo.enabled:
+            in_token = await self.fomo.token_wallets(candidate.address, candidate.chain)
+            elite = await self.fomo.elite_wallets()
+            if elite:
+                in_token &= elite
+            fomo_set |= in_token
+        if fomo_set:
+            fomo = whales.crowd_read(holders, trades, fomo_set)
+            values["fomo_inside"] = float(fomo.inside)
+            values["fomo_net_flow"] = fomo.net_flow
+            result.notes.append(
+                f"fomo: {fomo.inside} inside {fomo.hold_pct:.0%} net {fomo.net_flow:+.2f}"
+            )
+        else:
+            result.unknown.update({"fomo_inside", "fomo_net_flow"})
+
+        whale_set = crowd_addresses(self.whale_rows, "whale")
+        size_pct = float(self.strategy.get("whales.size_pct", 0.02))
+        whale = whales.crowd_read(holders, trades, whale_set, size_pct=size_pct)
+        values["whale_hold_pct"] = whale.hold_pct
+        values["whale_net_flow"] = whale.net_flow
+        result.notes.append(
+            f"whales: {whale.inside} hold {whale.hold_pct:.0%} net {whale.net_flow:+.2f}"
+        )
+        return values
+
+    async def _narrative_features(
+        self, candidate: Candidate, result: Enrichment, values: dict[str, float]
+    ) -> dict[str, float]:
+        """Twitter chatter, bubble/funding cluster, copy-trade flag.
+
+        Copy is a boost on a young small launch with labeled flow — never a
+        reason to chase a whale stacking an old $SOL bag.
+        """
+        out: dict[str, float] = {}
+        holders_ok = "top10_pct" not in result.unknown
+        cluster = result.holders.largest_funding_cluster_pct if holders_ok else 0.0
+        if self.bubbles and self.bubbles.enabled:
+            bm = await self.bubbles.cluster_pct(candidate.chain, candidate.address)
+            if bm is not None:
+                cluster = max(cluster, bm)
+                holders_ok = True
+        if holders_ok:
+            out["cluster_pct"] = cluster
+        else:
+            result.unknown.add("cluster_pct")
+
+        if self.twitter and self.twitter.enabled:
+            n = await self.twitter.mentions(candidate.symbol, candidate.address)
+            if n is None:
+                result.unknown.add("twitter_mentions")
+            else:
+                out["twitter_mentions"] = n
+                if n:
+                    result.notes.append(f"twitter: {n:.0f} recent mentions")
+        else:
+            result.unknown.add("twitter_mentions")
+
+        out["copy_signal"] = copy_flag(
+            age_minutes=candidate.age_minutes,
+            mcap_usd=candidate.mcap_usd,
+            smart_buys=values.get("smart_money_buys", 0.0),
+            fomo_inside=values.get("fomo_inside", 0.0),
+            fomo_net_flow=values.get("fomo_net_flow", 0.0),
+            whale_net_flow=values.get("whale_net_flow", 0.0),
+            strategy=self.strategy,
+            chain=candidate.chain,
+        )
+        return out
 
     def _aggregate_only_features(
         self, candidate: Candidate, result: Enrichment
@@ -329,8 +446,14 @@ class Enricher:
                 "retail_share_delta_5m",
                 "bot_share",
                 "axiom_share",
+                "known_holder_pct",
+                "top1_pct",
                 "mint_authority",
                 "freeze_authority",
+                "fomo_inside",
+                "fomo_net_flow",
+                "whale_hold_pct",
+                "whale_net_flow",
             }
         )
         result.notes.append(f"{candidate.chain.value}: aggregate-only enrichment")

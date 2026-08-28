@@ -26,12 +26,12 @@ log = get("providers")
 
 DEXSCREENER = "https://api.dexscreener.com"
 
-# Dexscreener's chain slugs. Robinhood Chain is absent as of 2026-08; those
-# candidates come from the chain's own RPC/subgraph instead of being faked.
+# Dexscreener chain slugs. Robinhood Chain is `robinhood` (not the numeric 4663).
 DEX_CHAIN_SLUG: dict[Chain, str] = {
     Chain.SOLANA: "solana",
     Chain.BNB: "bsc",
     Chain.BASE: "base",
+    Chain.ROBINHOOD_CHAIN: "robinhood",
 }
 SLUG_TO_CHAIN = {v: k for k, v in DEX_CHAIN_SLUG.items()}
 
@@ -71,6 +71,7 @@ class PairSnapshot:
             pool_address=self.pair_address,
             quote_asset=self.quote_symbol,
             source=source,
+            dex_id=self.dex_id,
         )
 
 
@@ -290,3 +291,206 @@ class Birdeye:
             )
         out.sort(key=lambda c: c.ts)
         return out
+
+
+class FomoGraph:
+    """Cope Capital maps Fomo handles to wallets. Research only — never a venue.
+
+    Without COPE_API_KEY this is a no-op and labeled `source=fomo` wallets in
+    config/whales.toml are the only Fomo profiles we know.
+    """
+
+    BASE = "https://api.cope.capital"
+
+    def __init__(self, http: Http, api_key: str = "", strategy: Any = None) -> None:
+        self.http = http
+        self.api_key = api_key
+        self.min_win_rate = 0.55
+        self.min_trades = 8
+        if strategy is not None:
+            self.min_win_rate = float(strategy.get("whales.min_win_rate", 0.55))
+            self.min_trades = int(strategy.get("whales.min_trades", 8))
+        http.limit("api.cope.capital", rate_per_sec=0.2, burst=2)
+        self._elite: set[str] = set()
+        self._elite_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self.enabled:
+            return None
+        try:
+            return await self.http.get(
+                f"{self.BASE}{path}",
+                params=params or {},
+                headers=self._headers(),
+            )
+        except HttpError as exc:
+            log.debug("cope failed", extra={"status": exc.status, "path": path})
+            return None
+
+    def _worth_chasing(self, row: dict[str, Any]) -> bool:
+        wr = _f(row.get("win_rate") or row.get("winRate") or row.get("accuracy"), -1.0)
+        if wr > 1.0:
+            wr /= 100.0
+        n = _f(row.get("trades") or row.get("trade_count") or row.get("n"), 0.0)
+        if wr < 0:
+            return True
+        return wr >= self.min_win_rate and n >= self.min_trades
+
+    def _rows(self, data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+        if isinstance(data, dict):
+            for key in ("data", "traders", "leaderboard", "results", "items"):
+                inner = data.get(key)
+                if isinstance(inner, list):
+                    return [r for r in inner if isinstance(r, dict)]
+            return [data]
+        return []
+
+    async def elite_wallets(self) -> set[str]:
+        if not self.enabled:
+            return set()
+        now = time.time()
+        if self._elite and now - self._elite_at < 1800:
+            return self._elite
+        data = await self._get("/v1/leaderboard", {"timeframe": "7d", "limit": "50"})
+        from .signals.whales import wallets_in
+
+        wallets: set[str] = set()
+        for row in self._rows(data):
+            if self._worth_chasing(row):
+                wallets |= wallets_in(row)
+        self._elite = wallets
+        self._elite_at = now
+        return wallets
+
+    async def token_wallets(self, mint: str, chain: Chain) -> set[str]:
+        if not self.enabled:
+            return set()
+        data = await self._get(f"/v1/tokens/{mint}/thesis", {"chain": chain.value})
+        from .signals.whales import wallets_in
+
+        return wallets_in(data, skip={mint})
+
+
+# Cashtags that would drown a "is anyone talking about this mint?" search.
+_TWITTER_SKIP = frozenset(
+    {
+        "SOL",
+        "BTC",
+        "ETH",
+        "USDC",
+        "USDT",
+        "WETH",
+        "BNB",
+        "WBNB",
+        "USD",
+        "PEPE",
+        "DOGE",
+        "WIF",
+        "BONK",
+    }
+)
+
+
+class Twitter:
+    """Recent mention counts. Needs TWITTER_BEARER_TOKEN (X API v2).
+
+    Light narrative check: is CT talking about this CA / $ticker in the last
+    couple of hours. Not a sentiment model.
+    """
+
+    def __init__(self, http: Http, bearer: str = "") -> None:
+        self.http = http
+        self.bearer = bearer
+        http.limit("api.x.com", rate_per_sec=0.15, burst=2)
+        self._cache: dict[str, tuple[float, float]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.bearer)
+
+    def _query(self, symbol: str, address: str) -> str:
+        parts: list[str] = []
+        if address and len(address) >= 32:
+            parts.append(address)
+        sym = (symbol or "").lstrip("$").strip()
+        if sym and 3 <= len(sym) <= 12 and sym.upper() not in _TWITTER_SKIP and sym.isascii():
+            parts.append(f"${sym}")
+        return " OR ".join(parts)
+
+    async def mentions(self, symbol: str, address: str) -> float | None:
+        if not self.enabled:
+            return None
+        q = self._query(symbol, address)
+        if not q:
+            return 0.0
+        now = time.monotonic()
+        cached = self._cache.get(q)
+        if cached and now - cached[0] < 90:
+            return cached[1]
+        try:
+            data = await self.http.get(
+                "https://api.x.com/2/tweets/counts/recent",
+                params={"query": q, "granularity": "hour"},
+                headers={"Authorization": f"Bearer {self.bearer}"},
+            )
+        except HttpError as exc:
+            log.debug("twitter counts failed", extra={"status": exc.status})
+            return None
+        buckets = (data or {}).get("data") or []
+        total = sum(_f(b.get("tweet_count")) for b in buckets[-2:])
+        self._cache[q] = (now, total)
+        return total
+
+
+class Bubblemaps:
+    """Nova-style cluster/bundle overlay. Optional, 25 credits/call.
+
+    Without a key we already compute a one-hop funding cluster on-chain.
+    """
+
+    CHAIN = {
+        Chain.SOLANA: "solana",
+        Chain.BNB: "bsc",
+        Chain.ROBINHOOD_CHAIN: "robinhood",
+    }
+
+    def __init__(self, http: Http, api_key: str = "") -> None:
+        self.http = http
+        self.api_key = api_key
+        http.limit("api.bubblemaps.io", rate_per_sec=0.2, burst=2)
+        self._cache: dict[str, tuple[float, float]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    async def cluster_pct(self, chain: Chain, address: str) -> float | None:
+        slug = self.CHAIN.get(chain)
+        if not self.enabled or not slug or not address:
+            return None
+        key = f"{slug}:{address}"
+        now = time.monotonic()
+        cached = self._cache.get(key)
+        if cached and now - cached[0] < 300:
+            return cached[1]
+        try:
+            data = await self.http.get(
+                f"https://api.bubblemaps.io/v0/tokens/metrics/{slug}/{address}",
+                headers={"X-ApiKey": self.api_key},
+            )
+        except HttpError as exc:
+            log.debug("bubblemaps failed", extra={"status": exc.status})
+            return None
+        stats = (data or {}).get("supply_stats") or {}
+        pct = _f(stats.get("bundles"))
+        self._cache[key] = (now, pct)
+        return pct

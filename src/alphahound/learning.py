@@ -139,11 +139,11 @@ NUDGES: dict[ErrorClass, tuple[Nudge, ...]] = {
             "rugs concentrate in thin pools",
         ),
         Nudge(
-            "gates.max_top10_pct",
+            "gates.max_unknown_top1_pct",
             -0.12,
             0.20,
             0.80,
-            "concentrated supply is the precondition for a rug",
+            "an unknown wallet holding most of supply is the precondition for a rug",
         ),
     ),
     ErrorClass.EXIT_TOO_FAST: (
@@ -345,7 +345,7 @@ def relax_costly_gates(
     relaxable = {
         "liquidity": ("gates.min_liquidity_usd", -0.10),
         "holders": ("gates.min_holder_count", -0.10),
-        "concentration": ("gates.max_top10_pct", 0.10),
+        "unknown_whale": ("gates.max_unknown_top1_pct", 0.10),
         "bundle": ("gates.max_bundle_pct", 0.10),
         "fresh_wallets": ("gates.max_fresh_wallet_pct", 0.10),
         "crowd_already_here": ("terminals.max_retail_terminal_share", 0.10),

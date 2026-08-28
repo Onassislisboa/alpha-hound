@@ -146,6 +146,16 @@ class RiskEngine:
         if any(p.candidate.address == candidate.address for p in open_positions):
             return Sizing(allowed=False, reason="already holding this token")
 
+        cooldown_m = self._p("reentry_cooldown_minutes", 180.0)
+        if cooldown_m > 0 and self.store.mint_traded_since(
+            candidate.key, now_ms() - int(cooldown_m * 60_000)
+        ):
+            return Sizing(allowed=False, reason="already traded this mint recently")
+
+        daily_cap = int(self._p("max_entries_per_day", 5))
+        if daily_cap > 0 and self.store.enter_count_since(utc_day_start_ms()) >= daily_cap:
+            return Sizing(allowed=False, reason=f"daily cap of {daily_cap} entries hit")
+
         equity = self.equity()
         if equity <= 0:
             return Sizing(allowed=False, reason="no equity left")

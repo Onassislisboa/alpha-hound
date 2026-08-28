@@ -191,7 +191,7 @@ class Store:
     def __init__(self, state_dir: Path) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
         self.path = state_dir / "alphahound.db"
-        self.conn = sqlite3.connect(self.path, isolation_level=None)
+        self.conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -363,6 +363,20 @@ class Store:
         ).fetchone()
         return float(row["pnl"])
 
+    def mint_traded_since(self, key: str, since_ms: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM trades WHERE key = ? AND closed_at_ms >= ? LIMIT 1",
+            (key, since_ms),
+        ).fetchone()
+        return row is not None
+
+    def enter_count_since(self, since_ms: int) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM decisions WHERE action = ? AND ts_ms >= ?",
+            (Action.ENTER.value, since_ms),
+        ).fetchone()
+        return int(row["n"])
+
     def consecutive_losses(self) -> int:
         rows = self.conn.execute(
             "SELECT pnl_usd FROM trades ORDER BY closed_at_ms DESC LIMIT 20"
@@ -479,6 +493,21 @@ class Store:
             "SELECT address FROM wallets WHERE chain = ? AND is_smart = 1", (chain.value,)
         ).fetchall()
         return {r["address"] for r in rows}
+
+    def record_buyer_outcome(self, address: str, chain: Chain, pnl_usd: float) -> None:
+        """Promote a wallet to smart money only after it shows up on winners.
+
+        One lucky sniper on a single win is not a KOL. Two winning appearances
+        with net-positive PnL is the cheapest filter that is not a tweet list.
+        """
+        row = self.conn.execute(
+            "SELECT trades, wins, pnl_usd FROM wallets WHERE address = ?", (address,)
+        ).fetchone()
+        trades = (int(row["trades"]) if row else 0) + 1
+        wins = (int(row["wins"]) if row else 0) + (1 if pnl_usd > 0 else 0)
+        pnl = (float(row["pnl_usd"]) if row else 0.0) + pnl_usd
+        is_smart = wins >= 2 and pnl > 0 and wins / trades >= 0.5
+        self.upsert_wallet(address, chain, trades, wins, pnl, is_smart)
 
     def upsert_wallet(
         self, address: str, chain: Chain, trades: int, wins: int, pnl_usd: float, is_smart: bool

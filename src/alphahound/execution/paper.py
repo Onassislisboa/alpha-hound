@@ -16,6 +16,7 @@ from ..log import get
 from ..models import Candidate, Chain, Fill, Quote, Side, VenueId, now_ms
 from ..providers import Dexscreener
 from ..settings import Config
+from ..fees import FeePlan
 
 log = get("paper")
 
@@ -43,7 +44,9 @@ class PaperVenue:
         reserve = max(1.0, liquidity_usd / 2.0)
         return min(0.95, size_usd / (reserve + size_usd))
 
-    async def quote(self, candidate: Candidate, side: Side, amount: float) -> Quote:
+    async def quote(
+        self, candidate: Candidate, side: Side, amount: float, fees: FeePlan | None = None
+    ) -> Quote:
         price = candidate.price_usd
         if price <= 0:
             snaps = await self.dex.token_pairs([candidate.address])
@@ -51,10 +54,12 @@ class PaperVenue:
         if price <= 0:
             return Quote(venue=self.id, in_amount=amount, out_amount=0.0, price=0.0, price_impact=1.0)
 
+        slip = (fees.slippage_bps / 10_000.0) if fees is not None else self.slippage
+
         if side is Side.BUY:
             notional = amount
             impact = self._impact(notional, candidate.liquidity_usd)
-            effective = price * (1.0 + impact + self.slippage)
+            effective = price * (1.0 + impact + slip)
             tokens = (notional * (1.0 - self.fee)) / effective
             return Quote(
                 venue=self.id,
@@ -67,7 +72,7 @@ class PaperVenue:
 
         notional = amount * price
         impact = self._impact(notional, candidate.liquidity_usd)
-        effective = price * (1.0 - impact - self.slippage)
+        effective = price * (1.0 - impact - slip)
         usd_out = amount * effective * (1.0 - self.fee)
         return Quote(
             venue=self.id,

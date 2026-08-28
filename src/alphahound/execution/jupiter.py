@@ -24,6 +24,7 @@ from ..net import Http
 from ..settings import Config, Settings
 from ..signals.solana import USDC, WSOL, SolanaReader
 from . import ExecutionError
+from ..fees import FeePlan, slip_bps
 
 log = get("jupiter")
 
@@ -109,9 +110,12 @@ class JupiterVenue:
         return self._keypair
 
     # -- venue interface ---------------------------------------------------
-    async def quote(self, candidate: Candidate, side: Side, amount: float) -> Quote:
+    async def quote(
+        self, candidate: Candidate, side: Side, amount: float, fees: FeePlan | None = None
+    ) -> Quote:
         sol_price = await self._sol_price_usd()
         decimals = await self._token_decimals(candidate.address)
+        slip = slip_bps(fees, self.slippage_bps)
 
         if side is Side.BUY:
             lamports = int((amount / sol_price) * 10**SOL_DECIMALS)
@@ -121,7 +125,7 @@ class JupiterVenue:
                 "inputMint": WSOL,
                 "outputMint": candidate.address,
                 "amount": lamports,
-                "slippageBps": self.slippage_bps,
+                "slippageBps": slip,
                 "restrictIntermediateTokens": "true",
             }
         else:
@@ -132,11 +136,15 @@ class JupiterVenue:
                 "inputMint": candidate.address,
                 "outputMint": WSOL,
                 "amount": base_units,
-                "slippageBps": self.slippage_bps,
+                "slippageBps": slip,
                 "restrictIntermediateTokens": "true",
             }
+        if fees is not None:
+            params["priorityFeeLamports"] = fees.priority_lamports
+            params["dynamicComputeUnitLimit"] = "true"
 
         data = await self._order(params)
+        data["_params"] = params
         impact = abs(float(data.get("priceImpactPct") or 0.0))
 
         if side is Side.BUY:
@@ -198,8 +206,10 @@ class JupiterVenue:
             raise ExecutionError(f"jupiter /execute returned {type(result)}")
         status = str(result.get("status", "")).lower()
         if status and status != "success":
+            sig = str(result.get("signature") or "")
             raise ExecutionError(
-                f"jupiter execute failed: {result.get('error') or result.get('code') or result}"
+                f"jupiter execute failed: {result.get('error') or result.get('code') or result}",
+                retryable=not bool(sig),
             )
 
         decimals = await self._token_decimals(candidate.address)
@@ -228,14 +238,18 @@ class JupiterVenue:
         self, candidate: Candidate, side: Side, amount: float, quote: Quote
     ) -> dict[str, Any]:
         raw = quote.raw or {}
-        return {
+        params = {
             "inputMint": raw.get("inputMint") or (WSOL if side is Side.BUY else candidate.address),
             "outputMint": raw.get("outputMint")
             or (candidate.address if side is Side.BUY else WSOL),
             "amount": raw.get("inAmount"),
-            "slippageBps": self.slippage_bps,
+            "slippageBps": raw.get("slippageBps") or self.slippage_bps,
             "restrictIntermediateTokens": "true",
         }
+        if raw.get("priorityFeeLamports") is not None:
+            params["priorityFeeLamports"] = raw["priorityFeeLamports"]
+            params["dynamicComputeUnitLimit"] = raw.get("dynamicComputeUnitLimit", "true")
+        return params
 
     @staticmethod
     def _fee_usd(order: dict[str, Any], sol_price: float) -> float:

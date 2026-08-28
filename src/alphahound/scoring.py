@@ -26,6 +26,9 @@ from .log import get
 from .models import Features, Score, TradeRecord
 from .portfolio import banked_from_peak
 from .settings import Config
+from .origin import launchpad_origin
+from .playbook import gate as pb_gate
+from .playbook import max_age_minutes as pb_max_age
 from .store import Store
 
 if TYPE_CHECKING:
@@ -83,6 +86,8 @@ NORMALIZERS: dict[str, object] = {
     "bundle_pct": _center(0.10, 4.0),
     "dev_holding_pct": _center(0.0, 10.0),
     "lp_locked_pct": lambda x: _clip(x, 0.0, 1.0),
+    "known_holder_pct": _tanh(3.0),
+    "top1_pct": _center(0.12, 5.0),
     # terminal attribution
     "retail_share": _center(0.25, 3.0),
     "retail_share_delta_5m": _tanh(10.0),
@@ -96,6 +101,13 @@ NORMALIZERS: dict[str, object] = {
     "net_inflow_usd_5m": _tanh(1.0 / 20_000.0),
     "avg_buy_size_usd": _tanh(1.0 / 500.0),
     "smart_money_buys": _tanh(0.5),
+    "fomo_inside": _tanh(0.35),
+    "fomo_net_flow": lambda x: _clip(x, -1.0, 1.0),
+    "whale_hold_pct": lambda x: _clip(x, 0.0, 1.0),
+    "whale_net_flow": lambda x: _clip(x, -1.0, 1.0),
+    "cluster_pct": lambda x: _clip(x, 0.0, 1.0),
+    "twitter_mentions": _log_center(0.7, 0.8),
+    "copy_signal": lambda x: _clip(x, 0.0, 1.0),
     # liquidity / cost
     "liquidity_usd": _log_center(4.3, 0.8),
     "liq_to_mcap": _tanh(8.0),
@@ -136,6 +148,11 @@ PRIOR_WEIGHTS: dict[str, float] = {
     "bundle_pct": -1.10,
     "dev_holding_pct": -1.00,
     "lp_locked_pct": 0.50,
+    # High top-10 is a smell, not a death sentence: known KOLs sitting in
+    # that top-10 on a *new* launch is the $TRUMP shape; this weight lets it
+    # through. Old coins are rejected by the age gate, not by this.
+    "known_holder_pct": 1.30,
+    "top1_pct": -0.70,
     "retail_share": -0.80,
     "retail_share_delta_5m": 1.40,
     "bot_share": -1.00,
@@ -146,7 +163,14 @@ PRIOR_WEIGHTS: dict[str, float] = {
     "buy_sell_ratio": 0.70,
     "net_inflow_usd_5m": 0.50,
     "avg_buy_size_usd": 0.20,
-    "smart_money_buys": 1.00,
+    "smart_money_buys": 1.60,
+    "fomo_inside": 1.10,
+    "fomo_net_flow": 1.40,
+    "whale_hold_pct": 0.70,
+    "whale_net_flow": 1.50,
+    "cluster_pct": -1.20,
+    "twitter_mentions": 0.90,
+    "copy_signal": 1.00,
     "liquidity_usd": 0.40,
     "liq_to_mcap": 0.30,
     "price_impact": -0.90,
@@ -257,13 +281,42 @@ def evaluate_gates(
     trail.
     """
 
+    chain = enr.candidate.chain
+
     def p(name: str, default: float) -> float:
-        return store.param(f"gates.{name}", float(strategy.get(f"gates.{name}", default)))
+        return pb_gate(strategy, chain, name, default, store)
 
     f = enr.features
     vetoes: list[str] = []
     abstained: list[str] = []
     unknown = enr.unknown
+
+    allowed, origin_reason = launchpad_origin(enr.candidate, strategy)
+    if not allowed:
+        vetoes.append(f"launchpad: {origin_reason}")
+
+    # $TRUMP/$MELANIA were the concentration *shape*, not tradable names.
+    # No created_at means we cannot prove this is a new launch.
+    max_age = pb_max_age(strategy, chain)
+    if not enr.candidate.created_at_ms:
+        abstained.append("age(unmeasured)")
+    elif enr.candidate.age_minutes > max_age:
+        vetoes.append(
+            f"age: {enr.candidate.age_minutes:.0f}m old (max {max_age:.0f}m, new launches only)"
+        )
+
+    # Playbook-only floors. Skip when the input was never measured so a missing
+    # Twitter key cannot veto every Solana mint.
+    min_vol = p("min_volume_5m", 0.0)
+    vol_seen = enr.snap is not None or enr.candidate.volume_5m_usd > 0
+    if min_vol > 0 and vol_seen and enr.candidate.volume_5m_usd < min_vol:
+        vetoes.append(f"volume: {enr.candidate.volume_5m_usd:.0f} < {min_vol:.0f} (5m)")
+    min_tw = p("min_twitter_mentions", 0.0)
+    if min_tw > 0 and "twitter_mentions" not in unknown and f.twitter_mentions < min_tw:
+        vetoes.append(f"twitter: {f.twitter_mentions:.0f} mentions (want {min_tw:.0f})")
+    max_cluster = p("max_cluster_pct", 0.0)
+    if max_cluster > 0 and "cluster_pct" not in unknown and f.cluster_pct > max_cluster:
+        vetoes.append(f"cluster: {f.cluster_pct:.0%} linked supply")
 
     def check(name: str, requires: tuple[str, ...], failed: bool, message: str) -> None:
         missing = [r for r in requires if r in unknown]
@@ -285,11 +338,20 @@ def evaluate_gates(
         f.holder_count < p("min_holder_count", 60),
         f"{f.holder_count:.0f} holders",
     )
+    # Concentration is a score, not a veto - $TRUMP's top-10 was well above
+    # 55% and it was still a real market. The exception is one UNKNOWN wallet
+    # holding most of the supply: that is a rug, and known KOLs/whales are
+    # what distinguish the two. If the top holder is in our KOL/smart set,
+    # known_holder_pct covers them and this check stays quiet.
+    unknown_whale = (
+        f.top1_pct > p("max_unknown_top1_pct", 0.50)
+        and f.known_holder_pct < f.top1_pct * 0.6
+    )
     check(
-        "concentration",
-        ("top10_pct",),
-        f.top10_pct > p("max_top10_pct", 0.55),
-        f"top10 {f.top10_pct:.0%}",
+        "unknown_whale",
+        ("top1_pct", "known_holder_pct"),
+        unknown_whale,
+        f"top holder {f.top1_pct:.0%} is not a known KOL/whale",
     )
     check(
         "dev_holding",

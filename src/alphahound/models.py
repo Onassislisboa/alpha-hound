@@ -61,6 +61,7 @@ class ExitReason(str, Enum):
     STOP_LOSS = "stop_loss"
     TIME_STOP = "time_stop"
     LIQUIDITY_DRAIN = "liquidity_drain"
+    THESIS_CUT = "thesis_cut"
     KILL_SWITCH = "kill_switch"
     MANUAL = "manual"
 
@@ -111,6 +112,7 @@ class Candidate:
     quote_asset: str = ""
     deployer: str = ""
     source: str = ""
+    dex_id: str = ""
     discovered_at_ms: int = field(default_factory=now_ms)
 
     @property
@@ -152,6 +154,11 @@ class Features:
     bundle_pct: float = 0.0
     dev_holding_pct: float = 0.0
     lp_locked_pct: float = 0.0
+    # Circulating share held by labeled KOLs + learned smart wallets. The
+    # number that lets a 70% top-10 still be a trade: if those wallets are
+    # known, concentration is a crowd, not a trap.
+    known_holder_pct: float = 0.0
+    top1_pct: float = 0.0
 
     # --- terminal attribution ---------------------------------------------
     # Level and derivative carry opposite signs on purpose. See the
@@ -168,7 +175,23 @@ class Features:
     buy_sell_ratio: float = 0.0
     net_inflow_usd_5m: float = 0.0
     avg_buy_size_usd: float = 0.0
+    # Unique smart/KOL wallets buying in the window. Distinct from
+    # known_holder_pct: flow is "they are buying now", holdings are "they already sit".
     smart_money_buys: float = 0.0
+    # Fomo profiles (labeled + Cope elite) sitting in the token, and whether
+    # that crowd is still buying. Not an execution venue.
+    fomo_inside: float = 0.0
+    fomo_net_flow: float = 0.0
+    # Moby-style key holders: % of supply and buy-vs-sell of wallets that are
+    # either labeled whales or large enough to count as one.
+    whale_hold_pct: float = 0.0
+    whale_net_flow: float = 0.0
+    # Nova bubblemap: largest linked-wallet cluster (funding hop or Bubblemaps).
+    cluster_pct: float = 0.0
+    # Recent CT mentions of the CA / $ticker. 0 with a key means silence.
+    twitter_mentions: float = 0.0
+    # 1 if labeled smart/Fomo is buying a still-young, still-small launch.
+    copy_signal: float = 0.0
 
     # --- liquidity / microstructure ---------------------------------------
     liquidity_usd: float = 0.0
@@ -299,6 +322,9 @@ class Position:
     # Price at the moment the decision was made, before execution latency. The
     # gap between this and entry_price is the late_entry error class.
     signal_price: float = 0.0
+    # Unique buy wallets seen at entry. Credited as smart money if the trade
+    # later wins; a rug does not promote them.
+    entry_buyers: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.tokens_remaining == 0.0:

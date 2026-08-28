@@ -21,7 +21,7 @@ from .net import Http
 from .providers import Dexscreener
 from .risk import RiskEngine
 from .scoring import Model
-from .settings import Settings, load_strategy, load_terminals
+from .settings import Settings, load_strategy, load_terminals, load_whales
 from .signals.solana import SolanaReader
 from .signals.terminals import discover_fee_accounts
 from .store import Store
@@ -97,6 +97,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "     -> retail/bot attribution is inert, so retail_share and axiom_share\n"
             "        contribute nothing. Run: alphahound discover-terminals"
         )
+
+    rows = load_whales()
+    fomo_n = sum(1 for r in rows if str(r.get("source", "")).lower() == "fomo")
+    whale_n = len(rows) - fomo_n
+    print(f"  labeled wallets   {whale_n} whale/moby, {fomo_n} fomo (config/whales.toml)")
+    print(
+        "  fomo research     "
+        + ("Cope key set" if settings.cope_api_key else "no COPE_API_KEY; labeled fomo only")
+    )
 
     overrides = store.all_params()
     if overrides:
@@ -398,6 +407,16 @@ def cmd_params(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preview(args: argparse.Namespace) -> int:
+    from .preview import serve
+
+    settings, strategy = _bootstrap()
+    store = Store(settings.state_dir)
+    equity = RiskEngine(strategy, store).equity()
+    serve(settings.state_dir, store, equity, args.port, settings, strategy)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # wiring
 # ---------------------------------------------------------------------------
@@ -463,6 +482,10 @@ def build_parser() -> argparse.ArgumentParser:
     params.add_argument("--set", metavar="NAME=VALUE")
     params.add_argument("--history", type=int, default=0)
     params.set_defaults(func=cmd_params)
+
+    prev = sub.add_parser("preview", help="live PnL / holds / sold in a browser tab")
+    prev.add_argument("--port", type=int, default=8765)
+    prev.set_defaults(func=cmd_preview)
 
     return parser
 

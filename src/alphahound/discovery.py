@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 from .log import get
 from .models import Candidate, Chain, now_ms
+from .origin import launchpad_origin
+from .playbook import max_age_minutes as pb_max_age
 from .providers import DEX_CHAIN_SLUG, Dexscreener
 from .settings import Config, Settings
 
@@ -134,9 +136,12 @@ class Discovery:
             return False
         if not candidate.address:
             return False
+        allowed, _reason = launchpad_origin(candidate, self.strategy)
+        if not allowed:
+            return False
 
         age = candidate.age_minutes
-        if candidate.created_at_ms and age > self.max_age_minutes:
+        if not candidate.created_at_ms or age > pb_max_age(self.strategy, candidate.chain):
             self.stats.dropped_stale += 1
             return False
 

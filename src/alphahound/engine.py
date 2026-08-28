@@ -27,7 +27,6 @@ from typing import IO
 from . import learning
 from .discovery import Discovery
 from .execution import ExecutionError, Router, build_router
-from .execution.relay import IntentRelay
 from .log import get
 from .models import (
     Action,
@@ -45,7 +44,9 @@ from .models import (
 )
 from .net import Http
 from .portfolio import ExitOrder, PositionManager
-from .providers import Birdeye, Dexscreener, Helius
+from .playbook import max_age_minutes as pb_max_age
+from .preview import write_preview
+from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter
 from .risk import RiskEngine
 from .scoring import Model, Scorer
 from .settings import (
@@ -54,6 +55,7 @@ from .settings import (
     Settings,
     load_strategy,
     load_terminals,
+    load_whales,
 )
 from .signals import Enricher
 from .signals.solana import SolanaReader
@@ -88,6 +90,9 @@ class Engine:
         )
         self.helius = Helius(self.http, settings.helius_api_key)
         self.birdeye = Birdeye(self.http, settings.birdeye_api_key)
+        self.fomo = FomoGraph(self.http, settings.cope_api_key, self.strategy)
+        self.twitter = Twitter(self.http, settings.twitter_bearer)
+        self.bubbles = Bubblemaps(self.http, settings.bubblemaps_api_key)
         # Without an RPC the whole distribution and terminal-attribution half of
         # the model is unmeasured, and an unmeasured feature contributes zero -
         # so the bot would quietly score every token on aggregates alone and
@@ -108,7 +113,9 @@ class Engine:
             else None
         )
 
-        self.router: Router = build_router(settings, self.strategy, self.dex, self.http)
+        self.router: Router = build_router(
+            settings, self.strategy, self.dex, self.http, store=self.store
+        )
         self.registry = build_registry(self.store, self.terminals)
         self.enricher = Enricher(
             store=self.store,
@@ -119,11 +126,14 @@ class Engine:
             helius=self.helius,
             birdeye=self.birdeye,
             probe=self.router.round_trip,
+            fomo=self.fomo,
+            whale_rows=load_whales(),
+            twitter=self.twitter,
+            bubbles=self.bubbles,
         )
         self.scorer = Scorer(Model.load(self.store), self.strategy, self.store, live=settings.live)
         self.risk = RiskEngine(self.strategy, self.store)
         self.exits = PositionManager(self.strategy, self.store)
-        self.relay = IntentRelay(self.http, settings)
         self.discovery = Discovery(settings, self.strategy, self.dex)
 
         self.positions: dict[str, Position] = {}
@@ -196,6 +206,7 @@ class Engine:
         async def body() -> None:
             await self.manage_positions()
             await self.update_shadows()
+            self._write_preview()
             self._heartbeat()
 
         await self._every(float(self.strategy.get("loop.tick_seconds", 3.0)), body, "risk pass")
@@ -226,6 +237,54 @@ class Engine:
         log.info("stopped")
 
     # -- the loop ----------------------------------------------------------
+
+    def _write_preview(self) -> None:
+        halted, reason = self.risk.halted()
+        holds = []
+        for position in self.positions.values():
+            mark = position.candidate.price_usd or position.entry_price
+            holds.append(
+                {
+                    "key": position.candidate.key,
+                    "symbol": position.candidate.symbol or "",
+                    "chain": position.candidate.chain.value,
+                    "size_usd": round(position.size_usd, 2),
+                    "unrealized_pct": round(position.gain(mark), 4),
+                    "remaining_pct": round(
+                        position.tokens_remaining / position.tokens if position.tokens else 0.0,
+                        4,
+                    ),
+                    "ladder": position.ladder_filled,
+                    "age_min": int((now_ms() - position.opened_at_ms) / 60_000),
+                }
+            )
+        write_preview(
+            self.settings.state_dir,
+            {
+                "ts_ms": now_ms(),
+                "mode": self.settings.mode,
+                "halted": halted,
+                "halt_reason": reason,
+                "equity_usd": round(self.risk.equity(), 2),
+                "watching": len(self.watching),
+                "watch": [
+                    {
+                        "symbol": c.symbol or "",
+                        "chain": c.chain.value,
+                        "address": c.address,
+                        "age_min": round(c.age_minutes, 1),
+                        "mcap": round(c.mcap_usd),
+                        "vol5m": round(c.volume_5m_usd),
+                        "dex": c.dex_id,
+                        "source": c.source,
+                    }
+                    for c in sorted(self.watching.values(), key=lambda x: x.age_minutes)[:24]
+                ],
+                "best_probability": round(self._best_probability, 3),
+                "tick": dict(self._tick_counts),
+                "holds": holds,
+            },
+        )
 
     def _heartbeat(self) -> None:
         """Periodic proof of life, with the reason nothing was bought.
@@ -338,6 +397,11 @@ class Engine:
         )
         trade.error_class = learning.classify(trade, self.strategy)
         self.store.record_trade(trade)
+        deployer = position.candidate.deployer
+        for wallet in position.entry_buyers:
+            if wallet and wallet != deployer:
+                self.store.record_buyer_outcome(wallet, position.candidate.chain, trade.pnl_usd)
+        self.enricher._smart_cache.pop(position.candidate.chain, None)
         self.positions.pop(position.candidate.key, None)
         self.enricher.forget(position.candidate.key)
         self.risk.note_trade_closed(trade.won)
@@ -489,8 +553,7 @@ class Engine:
                 unknown=enrichment.unknown,
             )
             decision_id = self.store.record_decision(decision)
-            await self.relay.publish(decision, sizing.size_usd, note=self.scorer.explain(score))
-            await self._enter(decision, decision_id)
+            await self._enter(decision, decision_id, buyers=enrichment.buyers)
 
     def _record(
         self,
@@ -515,7 +578,7 @@ class Engine:
             )
         )
 
-    async def _enter(self, decision: Decision, decision_id: int) -> None:
+    async def _enter(self, decision: Decision, decision_id: int, buyers: list[str] | None = None) -> None:
         candidate = decision.candidate
         signal_price = candidate.price_usd
         try:
@@ -564,6 +627,7 @@ class Engine:
             entry_features=decision.features,
             entry_unknown=sorted(decision.unknown),
             signal_price=signal_price,
+            entry_buyers=list(buyers or []),
         )
         self.positions[candidate.key] = position
         self._save_positions()
@@ -614,12 +678,12 @@ class Engine:
 
     # -- housekeeping ------------------------------------------------------
     def _prune_watching(self) -> None:
-        max_age = float(self.strategy.get("loop.max_candidate_age_minutes", 180))
         for key, candidate in list(self.watching.items()):
             if key in self.positions:
                 continue
-            age = candidate.age_minutes or (now_ms() - candidate.discovered_at_ms) / 60_000.0
-            if age > max_age:
+            if not candidate.created_at_ms or candidate.age_minutes > pb_max_age(
+                self.strategy, candidate.chain
+            ):
                 del self.watching[key]
                 self.enricher.forget(key)
 

@@ -22,9 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from alphahound import backtest, learning  # noqa: E402
 from alphahound.models import (  # noqa: E402
+    Action,
     Candidate,
     Candle,
     Chain,
+    Decision,
     ErrorClass,
     ExitReason,
     Features,
@@ -310,7 +312,13 @@ class TestGates(unittest.TestCase):
         )
         for name, value in overrides.items():
             setattr(features, name, value)
-        candidate = Candidate(chain=Chain.SOLANA, address="mint", price_usd=1.0)
+        candidate = Candidate(
+            chain=Chain.SOLANA,
+            address="mintpump",
+            price_usd=1.0,
+            dex_id="pumpfun",
+            created_at_ms=now_ms() - 60_000,
+        )
         return Enrichment(
             candidate=candidate,
             features=features,
@@ -336,10 +344,18 @@ class TestGates(unittest.TestCase):
 
         scorer = Scorer(Model(), STRATEGY, self.store, live=True)
         thin = Candidate(
-            chain=Chain.SOLANA, address="mint", price_usd=1.0, liquidity_usd=900.0
+            chain=Chain.SOLANA,
+            address="mintpump",
+            price_usd=1.0,
+            liquidity_usd=900.0,
+            dex_id="pumpfun",
         )
         deep = Candidate(
-            chain=Chain.SOLANA, address="mint2", price_usd=1.0, liquidity_usd=90_000.0
+            chain=Chain.SOLANA,
+            address="mint2pump",
+            price_usd=1.0,
+            liquidity_usd=90_000.0,
+            dex_id="pumpfun",
         )
         cheap_thin = Enricher.free_enrichment(thin)  # no network touched
         cheap_deep = Enricher.free_enrichment(deep)
@@ -377,6 +393,104 @@ class TestGates(unittest.TestCase):
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("liquidity" in v for v in vetoes))
 
+    def test_handmade_raydium_is_rejected(self):
+        from alphahound.origin import launchpad_origin
+
+        handmade = Candidate(
+            chain=Chain.SOLANA,
+            address="SoRandomHandmade111111111111111111111111111",
+            dex_id="raydium",
+        )
+        ok, reason = launchpad_origin(handmade, STRATEGY)
+        self.assertFalse(ok)
+        self.assertIn("handmade", reason)
+
+        pump = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump",
+            dex_id="raydium",
+        )
+        self.assertTrue(launchpad_origin(pump, STRATEGY)[0])
+
+        bonk = Candidate(
+            chain=Chain.SOLANA,
+            address="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxbonk",
+            dex_id="letsbonk",
+        )
+        self.assertFalse(launchpad_origin(bonk, STRATEGY)[0])
+
+        trump = Candidate(
+            chain=Chain.SOLANA,
+            address="6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+            dex_id="raydium",
+        )
+        self.assertFalse(launchpad_origin(trump, STRATEGY)[0])
+
+        pons = Candidate(chain=Chain.ROBINHOOD_CHAIN, address="0xabc", dex_id="uniswap")
+        self.assertTrue(launchpad_origin(pons, STRATEGY)[0])
+
+        broker = Candidate(chain=Chain.ROBINHOOD_BROKER, address="BTC")
+        self.assertFalse(launchpad_origin(broker, STRATEGY)[0])
+
+        four = Candidate(chain=Chain.BNB, address="0xdef", dex_id="fourmeme")
+        self.assertTrue(launchpad_origin(four, STRATEGY)[0])
+
+        pancake = Candidate(chain=Chain.BNB, address="0xdef", dex_id="pancakeswap")
+        self.assertFalse(launchpad_origin(pancake, STRATEGY)[0])
+
+    def test_old_token_is_vetoed_even_on_a_launchpad(self):
+        enr = self.enrichment()
+        enr.mint = _FakeMint(None, None)
+        enr.candidate.created_at_ms = now_ms() - 4 * 60 * 60 * 1000
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any(v.startswith("age:") for v in vetoes), vetoes)
+
+    def test_known_kol_excuses_a_concentrated_top10(self):
+        # The $TRUMP shape: top holder has 70%, but that holder is a known whale.
+        enr = self.enrichment(top10_pct=0.70, top1_pct=0.70, known_holder_pct=0.70)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertEqual(vetoes, [], msg=f"KOL-held concentration must not veto: {vetoes}")
+
+        rug = self.enrichment(top10_pct=0.70, top1_pct=0.70, known_holder_pct=0.0)
+        rug.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(rug, STRATEGY, self.store, live=True)
+        self.assertTrue(any("unknown_whale" in v for v in vetoes))
+
+    def test_unmeasured_twitter_is_not_a_live_veto(self):
+        enr = self.enrichment()
+        enr.mint = _FakeMint(None, None)
+        enr.unknown.update({"twitter_mentions", "cluster_pct"})
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertEqual(vetoes, [], msg=f"missing twitter/bubblemaps key must not halt solana: {vetoes}")
+
+    def test_measured_cluster_vetoes(self):
+        enr = self.enrichment(cluster_pct=0.70)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any("cluster:" in v for v in vetoes), vetoes)
+
+    def test_robinhood_age_window_is_shorter(self):
+        enr = self.enrichment()
+        enr.mint = _FakeMint(None, None)
+        enr.candidate.chain = Chain.ROBINHOOD_CHAIN
+        enr.candidate.dex_id = "pons"
+        enr.candidate.address = "0xabc"
+        enr.candidate.created_at_ms = now_ms() - 90 * 60_000
+        enr.features.twitter_mentions = 20
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any(v.startswith("age:") for v in vetoes), vetoes)
+
+    def test_robinhood_silence_on_twitter_vetoes_when_measured(self):
+        enr = self.enrichment()
+        enr.mint = _FakeMint(None, None)
+        enr.candidate.chain = Chain.ROBINHOOD_CHAIN
+        enr.candidate.dex_id = "pons"
+        enr.candidate.address = "0xabc"
+        enr.features.twitter_mentions = 0
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any("twitter:" in v for v in vetoes), vetoes)
+
 
 class _FakeMint:
     def __init__(self, mint_authority, freeze_authority):
@@ -405,7 +519,7 @@ class TestRisk(unittest.TestCase):
         sizing = self.risk.size(thin, score, payoff, [])
         self.assertTrue(sizing.allowed)
         self.assertEqual(sizing.binding_constraint, "pool_liquidity")
-        self.assertLessEqual(sizing.size_usd, 2_000.0 * 0.010 + 1e-9)
+        self.assertLessEqual(sizing.size_usd, 2_000.0 * 0.008 + 1e-9)
 
     def test_kill_switch_stops_sizing(self):
         self.risk.engage_kill_switch("test")
@@ -422,6 +536,50 @@ class TestRisk(unittest.TestCase):
         before = self.risk.equity()
         self.store.record_trade(_trade(pnl=-200.0))
         self.assertAlmostEqual(self.risk.equity(), before - 200.0, places=6)
+
+    def test_already_holding_blocks_a_second_order(self):
+        score = Score(probability=0.90, expected_value=0.5)
+        payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
+        c = Candidate(chain=Chain.SOLANA, address="mint", liquidity_usd=10**6, price_usd=1.0)
+        held = Position(
+            candidate=c, venue=VenueId.PAPER, entry_price=1.0, size_usd=20.0, tokens=20.0
+        )
+        sizing = self.risk.size(c, score, payoff, [held])
+        self.assertFalse(sizing.allowed)
+        self.assertIn("already", sizing.reason)
+
+    def test_reentry_cooldown_after_a_close(self):
+        self.store.record_trade(_trade(pnl=1.0))
+        score = Score(probability=0.90, expected_value=0.5)
+        payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
+        c = Candidate(chain=Chain.SOLANA, address="mint", liquidity_usd=10**6, price_usd=1.0)
+        sizing = self.risk.size(c, score, payoff, [])
+        self.assertFalse(sizing.allowed)
+        self.assertIn("recently", sizing.reason)
+
+    def test_daily_entry_cap(self):
+        score = Score(probability=0.90, expected_value=0.5)
+        payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
+        for i in range(int(STRATEGY.get("risk.max_entries_per_day", 5))):
+            self.store.record_decision(
+                Decision(
+                    candidate=Candidate(
+                        chain=Chain.SOLANA, address=f"m{i}", liquidity_usd=10**6, price_usd=1.0
+                    ),
+                    features=Features(),
+                    score=score,
+                    action=Action.ENTER,
+                    size_usd=10.0,
+                )
+            )
+        sizing = self.risk.size(
+            Candidate(chain=Chain.SOLANA, address="fresh", liquidity_usd=10**6, price_usd=1.0),
+            score,
+            payoff,
+            [],
+        )
+        self.assertFalse(sizing.allowed)
+        self.assertIn("daily cap", sizing.reason)
 
 
 class TestExits(unittest.TestCase):
@@ -447,8 +605,8 @@ class TestExits(unittest.TestCase):
 
     def test_ladder_fractions_are_of_the_original_position(self):
         position = self.position()
-        # A jump straight past every rung must sell the whole ladder, not one
-        # rung, and the fractions must convert correctly to "of remaining".
+        # A jump straight past every rung must sell the ladder (60%), not one
+        # rung. The remaining 40% is the runner and waits for the trail.
         orders = self.manager.evaluate(position, 5.0, 100_000.0)
         self.assertEqual(len(orders), 3)
         remaining = 1.0
@@ -456,7 +614,7 @@ class TestExits(unittest.TestCase):
         for order in orders:
             sold += remaining * order.fraction
             remaining -= remaining * order.fraction
-        self.assertAlmostEqual(sold, 1.0, places=6)
+        self.assertAlmostEqual(sold, 0.60, places=6)
 
     def test_liquidity_drain_outranks_take_profit(self):
         position = self.position()
@@ -488,6 +646,14 @@ class TestExits(unittest.TestCase):
         position.opened_at_ms = now_ms() - 90 * 60_000
         orders = self.manager.evaluate(position, 1.02, 100_000.0)
         self.assertIs(orders[0].reason, ExitReason.TIME_STOP)
+
+    def test_thesis_cut_dumps_the_spike_before_first_rung(self):
+        position = self.position()
+        self.manager.observe(position, 1.30, 100_000.0)
+        # ~29% off peak, still above the 22% hard stop from entry.
+        orders = self.manager.evaluate(position, 0.92, 100_000.0)
+        self.assertEqual(len(orders), 1)
+        self.assertIs(orders[0].reason, ExitReason.THESIS_CUT)
 
     def test_excursions(self):
         position = self.position()
@@ -748,6 +914,15 @@ class TestStore(unittest.TestCase):
             # Released, so a restart works without manual cleanup.
             lock_state_dir(state).close()
 
+    def test_a_wallet_becomes_smart_after_two_wins(self):
+        self.store.record_buyer_outcome("KOL1", Chain.SOLANA, +40.0)
+        self.assertNotIn("KOL1", self.store.smart_wallets(Chain.SOLANA))
+        self.store.record_buyer_outcome("KOL1", Chain.SOLANA, +20.0)
+        self.assertIn("KOL1", self.store.smart_wallets(Chain.SOLANA))
+        self.store.record_buyer_outcome("SNIPER", Chain.SOLANA, -50.0)
+        self.store.record_buyer_outcome("SNIPER", Chain.SOLANA, -50.0)
+        self.assertNotIn("SNIPER", self.store.smart_wallets(Chain.SOLANA))
+
     def test_consecutive_losses(self):
         self.store.record_trade(_trade(pnl=-10.0))
         self.store.record_trade(_trade(pnl=-10.0))
@@ -769,6 +944,138 @@ class TestStore(unittest.TestCase):
         self.assertEqual(self.store.active_weights()[0], v1)
         self.store.activate_weights(v2)
         self.assertEqual(self.store.active_weights()[0], v2)
+
+
+class TestCrowd(unittest.TestCase):
+    def test_whale_hold_pct_and_buy_vs_sell(self):
+        from alphahound.signals.distribution import Holder
+        from alphahound.signals.whales import crowd_read
+
+        holders = [
+            Holder(address="W1", balance=50),
+            Holder(address="W2", balance=40),
+            Holder(address="R", balance=10),
+        ]
+        labeled = crowd_read(holders, [], {"W1"})
+        self.assertEqual(labeled.inside, 1)
+        self.assertAlmostEqual(labeled.hold_pct, 0.50)
+
+        buying = crowd_read(
+            holders,
+            [
+                flow.Trade(ts_ms=1, side=Side.BUY, price=1, size_usd=800, wallet="W1"),
+                flow.Trade(ts_ms=1, side=Side.SELL, price=1, size_usd=200, wallet="W1"),
+            ],
+            {"W1"},
+        )
+        self.assertGreater(buying.net_flow, 0)
+
+        selling = crowd_read(
+            holders,
+            [flow.Trade(ts_ms=1, side=Side.SELL, price=1, size_usd=500, wallet="W1")],
+            {"W1"},
+        )
+        self.assertLess(selling.net_flow, 0)
+
+        sized = crowd_read(holders, [], set(), size_pct=0.15)
+        self.assertEqual(sized.inside, 2)
+        self.assertAlmostEqual(sized.hold_pct, 0.90)
+
+    def test_chase_false_is_not_copied(self):
+        from alphahound.settings import crowd_addresses
+
+        rows = [
+            {"address": "FOMO1", "source": "fomo", "chase": False},
+            {"address": "FOMO2", "source": "fomo"},
+            {"address": "WHALE1", "source": "moby", "class": "whale"},
+        ]
+        self.assertEqual(crowd_addresses(rows, "fomo"), {"FOMO2"})
+        self.assertEqual(crowd_addresses(rows, "whale"), {"WHALE1"})
+
+    def test_cope_wallet_walk_skips_the_mint(self):
+        from alphahound.signals.whales import wallets_in
+
+        payload = {
+            "positions": [
+                {"handle": "alpha", "wallet": "So11111111111111111111111111111111111111112"},
+                {"address": "MintMintMintMintMintMintMintMintMintMint111"},
+            ]
+        }
+        found = wallets_in(payload, skip={"MintMintMintMintMintMintMintMintMintMint111"})
+        self.assertEqual(found, {"So11111111111111111111111111111111111111112"})
+
+
+class TestFees(unittest.TestCase):
+    def test_thin_book_asks_more_slip_than_a_busy_one(self):
+        from alphahound.fees import plan_for
+
+        thin = Candidate(
+            chain=Chain.SOLANA, address="a", volume_5m_usd=3_000, liquidity_usd=20_000
+        )
+        busy = Candidate(
+            chain=Chain.SOLANA, address="b", volume_5m_usd=80_000, liquidity_usd=200_000
+        )
+        self.assertGreater(
+            plan_for(thin, STRATEGY, 0).slippage_bps,
+            plan_for(busy, STRATEGY, 0).slippage_bps,
+        )
+
+    def test_retries_bump_then_hard_cap(self):
+        from alphahound.fees import plan_for
+
+        c = Candidate(chain=Chain.SOLANA, address="a", volume_5m_usd=15_000)
+        p0 = plan_for(c, STRATEGY, 0)
+        p1 = plan_for(c, STRATEGY, 1)
+        p2 = plan_for(c, STRATEGY, 2)
+        p9 = plan_for(c, STRATEGY, 9)
+        self.assertGreater(p1.slippage_bps, p0.slippage_bps)
+        self.assertGreater(p2.slippage_bps, p1.slippage_bps)
+        self.assertEqual(p9.slippage_bps, p2.slippage_bps)
+        self.assertEqual(p9.priority_lamports, p2.priority_lamports)
+        self.assertLessEqual(p2.slippage_bps, int(STRATEGY.get("execution.max_slippage_bps", 350)))
+        self.assertLessEqual(
+            p2.priority_lamports, int(STRATEGY.get("execution.max_priority_lamports", 350_000))
+        )
+
+
+class TestPlaybook(unittest.TestCase):
+    def test_copy_signal_only_on_young_small_launches(self):
+        from alphahound.playbook import copy_signal
+
+        buying = dict(
+            smart_buys=3.0,
+            fomo_inside=0.0,
+            fomo_net_flow=0.0,
+            whale_net_flow=0.0,
+            strategy=STRATEGY,
+            chain=Chain.SOLANA,
+        )
+        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=80_000, **buying), 1.0)
+        self.assertEqual(copy_signal(age_minutes=120, mcap_usd=80_000, **buying), 0.0)
+        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=5_000_000, **buying), 0.0)
+        idle = dict(buying, smart_buys=0.0)
+        self.assertEqual(copy_signal(age_minutes=8, mcap_usd=80_000, **idle), 0.0)
+
+    def test_evm_key_falls_back_then_overrides(self):
+        from alphahound.settings import Settings
+
+        shared = Settings(evm_private_key="0xaaa")
+        self.assertEqual(shared.evm_key_for(Chain.BNB), "0xaaa")
+        split = Settings(
+            evm_private_key="0xaaa",
+            evm_keys={Chain.BNB: "0xbbb", Chain.ROBINHOOD_CHAIN: "0xccc"},
+        )
+        self.assertEqual(split.evm_key_for(Chain.BNB), "0xbbb")
+        self.assertEqual(split.evm_key_for(Chain.ROBINHOOD_CHAIN), "0xccc")
+        self.assertEqual(split.evm_key_for(Chain.BASE), "0xaaa")
+
+    def test_robinhood_playbook_is_stricter_on_age(self):
+        from alphahound.playbook import max_age_minutes
+
+        self.assertLess(
+            max_age_minutes(STRATEGY, Chain.ROBINHOOD_CHAIN),
+            max_age_minutes(STRATEGY, Chain.SOLANA),
+        )
 
 
 if __name__ == "__main__":

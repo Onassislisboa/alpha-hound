@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 from .log import get
 from .models import ExitReason, Position, now_ms
+from .playbook import ladder as pb_ladder
+from .playbook import thesis_cut as pb_thesis_cut
 from .settings import Config
 from .store import Store
 
@@ -37,10 +39,8 @@ class PositionManager:
     def _p(self, name: str, default: float) -> float:
         return self.store.param(f"exits.{name}", float(self.strategy.get(f"exits.{name}", default)))
 
-    @property
-    def ladder(self) -> list[tuple[float, float]]:
-        raw = self.strategy.get("exits.take_profit_ladder", [[1.35, 0.34], [2.0, 0.33], [3.5, 0.33]])
-        return [(float(m), float(f)) for m, f in raw]
+    def _ladder(self, position: Position) -> list[tuple[float, float]]:
+        return pb_ladder(self.strategy, position.candidate.chain)
 
     def observe(self, position: Position, price: float, liquidity_usd: float) -> None:
         if price > position.peak_price:
@@ -82,7 +82,25 @@ class PositionManager:
         if gain <= -stop:
             return [ExitOrder(1.0, ExitReason.STOP_LOSS, f"{gain:.1%} vs stop -{stop:.1%}")]
 
-        ladder = self.ladder
+        # Frank: the spike died before we banked initials. Off-peak cut, only
+        # while still above the hard stop — otherwise the stop already fired.
+        cut = pb_thesis_cut(self.strategy, position.candidate.chain)
+        if (
+            cut > 0
+            and position.ladder_filled == 0
+            and position.peak_price > position.entry_price * 1.08
+            and price <= position.peak_price * (1.0 - cut)
+        ):
+            off = 1.0 - price / position.peak_price
+            return [
+                ExitOrder(
+                    1.0,
+                    ExitReason.THESIS_CUT,
+                    f"{off:.0%} off peak before first take",
+                )
+            ]
+
+        ladder = self._ladder(position)
         # `fraction` in the ladder is of the ORIGINAL position, while an
         # ExitOrder is a fraction of what is LEFT. The conversion has to track
         # the rungs queued in this same tick, because a fast move can clear

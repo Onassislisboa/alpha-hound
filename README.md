@@ -9,11 +9,35 @@ Paper mode by default; nothing here spends real money until you tell it to.
 
 ```bash
 python -m venv .venv && .venv/Scripts/activate     # Linux/macOS: source .venv/bin/activate
-pip install -e .
+pip install -e ".[all]"
 cp .env.example .env
-alphahound doctor
-alphahound run --paper
+python -m alphahound doctor
+python -m alphahound run --paper
+python -m alphahound preview --port 8765
+# open http://127.0.0.1:8765/
 ```
+
+Paper is on by default. The preview shows what it is allowed to trade (launchpad,
+age, copy window) and what is **in view**. Holds stay empty until a mint clears
+the gates **and** scores ≥ 58% win / ≥ 4% EV. On the public Solana RPC that
+almost never happens: holder counts, terminal attribution and sell quotes come
+back unmeasured, and unmeasured features contribute zero.
+
+### Missing for a paper fill you can watch
+
+1. Paid Solana RPC in `SOLANA_RPC_URL` (Helius / Triton / QuickNode). Public RPC rate-limits the enricher.
+2. `HELIUS_API_KEY` — exact holder counts. Without it the holder gate cannot pass in live, and paper scores blind.
+3. `python -m alphahound discover-terminals` then `label-terminal` at least one retail fee account. Until then `retail_share` is inert and the thesis cannot fire.
+4. Optional: `BIRDEYE_API_KEY`, `TWITTER_BEARER_TOKEN`, `BUBBLEMAPS_API_KEY`, `COPE_API_KEY`, wallets in `config/whales.toml`.
+
+### Missing for live (Solana first)
+
+1. `JUPITER_API_KEY` from [portal.jup.ag](https://portal.jup.ag).
+2. Fund the Solana hot wallet with a small amount of SOL. It is a hot wallet.
+3. `MODE=live`. Keep `ENABLED_CHAINS=solana` until paper has ~40 closed trades.
+4. BNB live also needs `ZEROEX_API_KEY` and BNB on that wallet. Robinhood Chain live needs ETH on chain 4663 for gas.
+
+No extra bot framework. Swaps go through **Jupiter** (Solana), **0x** (BNB), **Uniswap V3** (Robinhood Chain). Fomo / Moby / Padre are research-only.
 
 ---
 
@@ -61,13 +85,13 @@ Verified against live documentation, August 2026. No invented endpoints.
 | **pump.fun** new-token stream via PumpPortal | Real websocket. |
 | **Helius / Birdeye** | Real, optional. Exact holder counts and candles. |
 | **Paper** | Real simulation: constant-product impact + latency + fees on both legs. |
-| **Fomo** (fomo.family) | **No public trading API.** Mobile-only. |
-| **Moby / MobyAgent** (mobyscreener.com) | **No public trading API.** Mobile-only. |
+| **Fomo** (fomo.family) | Research only. Labeled wallets + optional Cope key. Never executes. |
+| **MobyScreener** | No public API. Whale % / buy-vs-sell computed on-chain from labeled + large holders. |
 
-Fomo and Moby are handled by `execution/relay.py`, which publishes the bot's
-decision as a signed webhook intent so you (or your own bridge) can act on it.
-It never reports a fill it did not get. If either platform ships an API, that
-file is the only thing that changes.
+Fomo and Moby are **not** execution venues. Paste wallets into `config/whales.toml`
+(and optionally set `COPE_API_KEY`) so the bot can see which profiles sit in a
+**new** launch, what % they hold, and whether they are buying or selling.
+Trades go through Jupiter / 0x / Uniswap V3 / paper.
 
 ## The signals
 
@@ -330,6 +354,7 @@ manual cleanup before restarting.
 |---|---|
 | `alphahound run [--paper]` | start the bot |
 | `alphahound doctor [--check-network]` | config, state, self-tuned params, connectivity |
+| `alphahound preview [--port 8765]` | live PnL, holds, sold — open the URL, leave the tab open |
 | `alphahound trades -n 50` | closed trades with error classes |
 | `alphahound weights` | learned vs prior weights, with observation counts |
 | `alphahound learn [--no-train]` | force a postmortem / training cycle |
@@ -345,22 +370,25 @@ manual cleanup before restarting.
 ```
 config/strategy.toml      every tunable, commented with the reasoning
 config/terminals.toml     attribution registry (fee accounts start empty)
+config/whales.toml        Fomo/Moby wallets to chase (research, not venues)
 src/alphahound/
   models.py               dataclasses; the feature vector contract
   settings.py             .env + TOML, stdlib only
   store.py                sqlite: decisions, shadows, trades, weights, params
   net.py                  per-host token bucket + retry
-  providers.py            Dexscreener / Helius / Birdeye
+  providers.py            Dexscreener / Helius / Birdeye / Cope (Fomo research)
   discovery.py            polling + pump.fun websocket
-  signals/                chart, distribution, terminals, flow, solana reader
+  signals/                chart, distribution, terminals, flow, whales, solana reader
   scoring.py              normalization, priors, gates, EV
+  playbook.py             per-chain age / copy / ladder / thesis cut
   risk.py                 Kelly, caps, kill switch, cooldown
-  execution/              router + paper, jupiter, evm, robinhood, relay
+  execution/              router + paper, jupiter, evm, robinhood
   portfolio.py            exit policy
+  preview.py              localhost operator board
   learning.py             postmortem, nudges, training, filter cost
   backtest.py             decision-log replay
   engine.py               the loop
-tests/test_core.py        52 tests, stdlib only, no install needed
+tests/test_core.py        77 tests, stdlib only, no install needed
 ```
 
 Core modules are stdlib-only on purpose: `python tests/test_core.py` runs with

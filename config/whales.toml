@@ -1,0 +1,15 @@
+# Wallets worth chasing, pasted from Fomo / MobyScreener.
+# The bot does not trade through either app. It uses these addresses to see
+# who is inside a *new* launch, what % they hold, and whether they are
+# buying or selling.
+#
+# source = "fomo" | "moby"
+# class  = "whale" | "kol" | "fomo"
+# chase  = false  → ignore for copy (still visible if you leave a comment)
+#
+# [[wallet]]
+# address = ""
+# source = "moby"
+# class = "whale"
+# handle = ""
+# chase = true

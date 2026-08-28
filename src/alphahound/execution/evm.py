@@ -20,6 +20,7 @@ from ..net import Http, HttpError
 from ..providers import Dexscreener
 from ..settings import Config, Settings
 from . import ExecutionError
+from ..fees import FeePlan, slip_bps
 
 log = get("evm")
 
@@ -99,22 +100,26 @@ class EvmRpc:
 class _EvmSignerMixin:
     settings: Settings
 
-    def _account(self):
-        cached = getattr(self, "_acct", None)
-        if cached is not None:
-            return cached
-        if not self.settings.evm_private_key:
-            raise ExecutionError("EVM_PRIVATE_KEY is not set")
+    def _account(self, chain: Chain | None = None):
+        key = self.settings.evm_key_for(chain)
+        if not key:
+            raise ExecutionError("EVM private key is not set for this chain")
+        cache: dict = getattr(self, "_accts", None) or {}
+        if not hasattr(self, "_accts"):
+            self._accts = cache
+        slot = chain.value if chain else "_"
+        if slot in cache:
+            return cache[slot]
         try:
             from eth_account import Account
         except ImportError as exc:  # pragma: no cover
             raise ExecutionError("pip install 'alphahound[evm]' to trade on EVM chains") from exc
-        acct = Account.from_key(self.settings.evm_private_key)
-        self._acct = acct
+        acct = Account.from_key(key)
+        cache[slot] = acct
         return acct
 
-    async def _sign_and_send(self, rpc: EvmRpc, tx: dict[str, Any]) -> str:
-        acct = self._account()
+    async def _sign_and_send(self, rpc: EvmRpc, tx: dict[str, Any], chain: Chain | None = None) -> str:
+        acct = self._account(chain)
         tx.setdefault("from", acct.address)
         tx.setdefault("nonce", await rpc.nonce(acct.address))
         tx.setdefault("gasPrice", await rpc.gas_price())
@@ -192,12 +197,15 @@ class ZeroExVenue(_EvmSignerMixin):
             raise ExecutionError("0x reports no liquidity for this pair")
         return data
 
-    async def quote(self, candidate: Candidate, side: Side, amount: float) -> Quote:
+    async def quote(
+        self, candidate: Candidate, side: Side, amount: float, fees: FeePlan | None = None
+    ) -> Quote:
         chain = candidate.chain
         chain_id = EVM_CHAIN_IDS[chain]
-        taker = self._account().address if self.settings.evm_private_key else None
+        taker = self._account(chain).address if self.settings.evm_key_for(chain) else None
         native_price = await self._native_price(chain)
         token_decimals = await self._token_decimals(chain, candidate.address)
+        slip = slip_bps(fees, self.slippage_bps)
 
         if side is Side.BUY:
             sell_amount = int((amount / native_price) * 10**18)
@@ -206,7 +214,7 @@ class ZeroExVenue(_EvmSignerMixin):
                 "sellToken": NATIVE_SENTINEL,
                 "buyToken": candidate.address,
                 "sellAmount": sell_amount,
-                "slippageBps": self.slippage_bps,
+                "slippageBps": slip,
             }
         else:
             params = {
@@ -214,7 +222,7 @@ class ZeroExVenue(_EvmSignerMixin):
                 "sellToken": candidate.address,
                 "buyToken": NATIVE_SENTINEL,
                 "sellAmount": int(amount * 10**token_decimals),
-                "slippageBps": self.slippage_bps,
+                "slippageBps": slip,
             }
         if taker:
             params["taker"] = taker
@@ -261,7 +269,7 @@ class ZeroExVenue(_EvmSignerMixin):
     ) -> Fill:
         chain = candidate.chain
         rpc = self.rpc(chain)
-        acct = self._account()
+        acct = self._account(chain)
         data = quote.raw
         if "transaction" not in data:
             params = dict(data.get("_params") or {})
@@ -281,7 +289,7 @@ class ZeroExVenue(_EvmSignerMixin):
         if tx_spec.get("gasPrice"):
             tx["gasPrice"] = int(tx_spec["gasPrice"])
 
-        tx_hash = await self._sign_and_send(rpc, tx)
+        tx_hash = await self._sign_and_send(rpc, tx, chain)
         await self._await_receipt(rpc, tx_hash, self.confirm_timeout)
 
         token_decimals = await self._token_decimals(chain, candidate.address)
@@ -323,7 +331,7 @@ class ZeroExVenue(_EvmSignerMixin):
             "gas": 120_000,
             "_chain_id": EVM_CHAIN_IDS[chain],
         }
-        tx_hash = await self._sign_and_send(rpc, approve_tx)
+        tx_hash = await self._sign_and_send(rpc, approve_tx, chain)
         await self._await_receipt(rpc, tx_hash, self.confirm_timeout)
 
 
@@ -479,9 +487,12 @@ class UniswapV3Venue(_EvmSignerMixin):
         self._best_fee[cache_key] = best[1]
         return best
 
-    async def quote(self, candidate: Candidate, side: Side, amount: float) -> Quote:
+    async def quote(
+        self, candidate: Candidate, side: Side, amount: float, fees: FeePlan | None = None
+    ) -> Quote:
         eth_price = await self._eth_price()
         token_decimals = await self._token_decimals(candidate.address)
+        slip = slip_bps(fees, self.slippage_bps)
 
         if side is Side.BUY:
             amount_in = int((amount / eth_price) * 10**18)
@@ -494,7 +505,13 @@ class UniswapV3Venue(_EvmSignerMixin):
                 out_amount=tokens,
                 price=price,
                 price_impact=ZeroExVenue._impact_from_mid(price, candidate.price_usd),
-                raw={"fee": fee, "amount_in": amount_in, "amount_out": out_raw, "side": "buy"},
+                raw={
+                    "fee": fee,
+                    "amount_in": amount_in,
+                    "amount_out": out_raw,
+                    "side": "buy",
+                    "slippage_bps": slip,
+                },
             )
 
         amount_in = int(amount * 10**token_decimals)
@@ -507,18 +524,25 @@ class UniswapV3Venue(_EvmSignerMixin):
             out_amount=usd_out,
             price=price,
             price_impact=ZeroExVenue._impact_from_mid(candidate.price_usd, price),
-            raw={"fee": fee, "amount_in": amount_in, "amount_out": out_raw, "side": "sell"},
+            raw={
+                "fee": fee,
+                "amount_in": amount_in,
+                "amount_out": out_raw,
+                "side": "sell",
+                "slippage_bps": slip,
+            },
         )
 
     async def execute(
         self, candidate: Candidate, side: Side, amount: float, quote: Quote
     ) -> Fill:
         w3 = self._codec()
-        acct = self._account()
+        acct = self._account(Chain.ROBINHOOD_CHAIN)
         token_in = self.weth if side is Side.BUY else candidate.address
         token_out = candidate.address if side is Side.BUY else self.weth
         amount_in = int(quote.raw["amount_in"])
-        min_out = int(quote.raw["amount_out"] * (1.0 - self.slippage_bps / 10_000.0))
+        slip = int(quote.raw.get("slippage_bps") or self.slippage_bps)
+        min_out = int(quote.raw["amount_out"] * (1.0 - slip / 10_000.0))
 
         await self._approve(token_in, self.router_address)
 
@@ -545,6 +569,7 @@ class UniswapV3Venue(_EvmSignerMixin):
                 "gas": 400_000,
                 "_chain_id": EVM_CHAIN_IDS[Chain.ROBINHOOD_CHAIN],
             },
+            Chain.ROBINHOOD_CHAIN,
         )
         await self._await_receipt(self.rpc, tx_hash, self.confirm_timeout)
 
@@ -566,7 +591,7 @@ class UniswapV3Venue(_EvmSignerMixin):
         )
 
     async def _approve(self, token: str, spender: str) -> None:
-        acct = self._account()
+        acct = self._account(Chain.ROBINHOOD_CHAIN)
         current = await self.rpc.eth_call(
             token, SEL_ALLOWANCE + _pad_address(acct.address) + _pad_address(spender)
         )
@@ -581,5 +606,6 @@ class UniswapV3Venue(_EvmSignerMixin):
                 "gas": 120_000,
                 "_chain_id": EVM_CHAIN_IDS[Chain.ROBINHOOD_CHAIN],
             },
+            Chain.ROBINHOOD_CHAIN,
         )
         await self._await_receipt(self.rpc, tx_hash, self.confirm_timeout)

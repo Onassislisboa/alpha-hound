@@ -37,6 +37,7 @@ from ..models import Candidate, Chain, Fill, Quote, Side, VenueId
 from ..net import Http, HttpError
 from ..settings import Settings
 from . import ExecutionError
+from ..fees import FeePlan
 
 log = get("robinhood")
 
@@ -121,7 +122,9 @@ class RobinhoodVenue:
         return float((data or {}).get("buying_power") or 0.0)
 
     # -- venue interface ---------------------------------------------------
-    async def quote(self, candidate: Candidate, side: Side, amount: float) -> Quote:
+    async def quote(
+        self, candidate: Candidate, side: Side, amount: float, fees: FeePlan | None = None
+    ) -> Quote:
         # For the brokerage the "address" is the trading pair symbol.
         symbol = candidate.address
         bid, ask = await self.best_bid_ask(symbol)

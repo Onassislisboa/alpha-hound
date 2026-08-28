@@ -17,9 +17,8 @@ Adapter status, honestly stated:
     robinhood   REAL. Robinhood Crypto brokerage, Ed25519-signed. Majors only.
 
 Fomo and Moby are absent from that list on purpose: neither publishes a
-trading API. They are handled by `relay.IntentRelay`, which is a notification
-sink rather than a venue, because a venue that cannot fill has no business
-pretending to be one.
+trading API. They are research signals (labeled wallets + on-chain hold %
+and buy/sell), not venues. Trades go through Jupiter / 0x / Uniswap / paper.
 """
 
 from __future__ import annotations
@@ -39,6 +38,7 @@ from ..models import (
 )
 from ..providers import Dexscreener
 from ..settings import Config
+from ..fees import FeePlan, plan_for
 
 log = get("execution")
 
@@ -53,7 +53,9 @@ WRAPPED_NATIVE: dict[Chain, str] = {
 
 
 class ExecutionError(RuntimeError):
-    pass
+    def __init__(self, message: str = "", *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class NotSupported(ExecutionError):
@@ -66,7 +68,9 @@ class Venue(Protocol):
 
     def supports(self, chain: Chain) -> bool: ...
 
-    async def quote(self, candidate: Candidate, side: Side, amount: float) -> Quote: ...
+    async def quote(
+        self, candidate: Candidate, side: Side, amount: float, fees: FeePlan | None = None
+    ) -> Quote: ...
 
     async def execute(
         self, candidate: Candidate, side: Side, amount: float, quote: Quote
@@ -83,10 +87,12 @@ class Router:
         strategy: Config,
         *,
         native_addresses: dict[Chain, str] | None = None,
+        store=None,
     ) -> None:
         self.venues = venues
         self.dex = dexscreener
         self.strategy = strategy
+        self.store = store
         self.native = dict(WRAPPED_NATIVE)
         self.native.update(native_addresses or {})
         self._native_price: dict[Chain, tuple[int, float]] = {}
@@ -136,15 +142,16 @@ class Router:
         except NotSupported as exc:
             return RoundTrip(ok=False, note=str(exc))
 
+        fees = plan_for(candidate, self.strategy, store=self.store)
         try:
-            buy = await venue.quote(candidate, Side.BUY, size_usd)
+            buy = await venue.quote(candidate, Side.BUY, size_usd, fees=fees)
         except Exception as exc:  # noqa: BLE001
             return RoundTrip(ok=False, note=f"buy quote failed: {exc}")
         if buy.out_amount <= 0:
             return RoundTrip(ok=False, note="buy quote returned zero output")
 
         try:
-            sell = await venue.quote(candidate, Side.SELL, buy.out_amount)
+            sell = await venue.quote(candidate, Side.SELL, buy.out_amount, fees=fees)
         except Exception as exc:  # noqa: BLE001
             # Cannot quote an exit. Treat as unsellable; this is the single most
             # valuable false negative in the system.
@@ -167,27 +174,58 @@ class Router:
 
     # -- trading -----------------------------------------------------------
     async def buy(self, candidate: Candidate, size_usd: float) -> Fill:
-        venue = self.venue_for(candidate.chain)
-        quote = await venue.quote(candidate, Side.BUY, size_usd)
-        max_drift = float(self.strategy.get("execution.max_price_drift_from_signal", 0.05))
-        if candidate.price_usd > 0 and quote.price > 0:
-            drift = abs(quote.price / candidate.price_usd - 1.0)
-            if drift > max_drift:
-                # The signal was computed against a price that no longer
-                # exists. Chasing it is how a good decision becomes a bad fill.
-                raise ExecutionError(
-                    f"price drifted {drift:.1%} since the signal (limit {max_drift:.1%})"
-                )
-        return await venue.execute(candidate, Side.BUY, size_usd, quote)
+        return await self._submit(candidate, Side.BUY, size_usd)
 
     async def sell(self, position: Position, tokens: float) -> Fill:
-        venue = self.venue_for(position.candidate.chain)
-        quote = await venue.quote(position.candidate, Side.SELL, tokens)
-        return await venue.execute(position.candidate, Side.SELL, tokens, quote)
+        return await self._submit(position.candidate, Side.SELL, tokens)
+
+    async def _submit(self, candidate: Candidate, side: Side, amount: float) -> Fill:
+        venue = self.venue_for(candidate.chain)
+        attempts = max(1, int(self.strategy.get("execution.max_submit_retries", 3)))
+        last: ExecutionError | None = None
+        for i in range(attempts):
+            fees = plan_for(candidate, self.strategy, attempt=i, store=self.store)
+            try:
+                quote = await venue.quote(candidate, side, amount, fees=fees)
+                if side is Side.BUY:
+                    max_drift = float(self.strategy.get("execution.max_price_drift_from_signal", 0.05))
+                    if candidate.price_usd > 0 and quote.price > 0:
+                        drift = abs(quote.price / candidate.price_usd - 1.0)
+                        if drift > max_drift:
+                            raise ExecutionError(
+                                f"price drifted {drift:.1%} since the signal (limit {max_drift:.1%})",
+                                retryable=False,
+                            )
+                log.info(
+                    "submit",
+                    extra={
+                        "side": side.value,
+                        "attempt": i + 1,
+                        "slippage_bps": fees.slippage_bps,
+                        "priority_lamports": fees.priority_lamports,
+                    },
+                )
+                return await venue.execute(candidate, side, amount, quote)
+            except ExecutionError as exc:
+                last = exc
+                if not exc.retryable or i + 1 >= attempts:
+                    raise
+                log.warning(
+                    "submit retry",
+                    extra={
+                        "side": side.value,
+                        "attempt": i + 1,
+                        "next_slippage_bps": plan_for(
+                            candidate, self.strategy, attempt=i + 1, store=self.store
+                        ).slippage_bps,
+                        "error": str(exc),
+                    },
+                )
+        raise last or ExecutionError("submit failed")
 
 
 def build_router(
-    settings, strategy: Config, dexscreener: Dexscreener, http
+    settings, strategy: Config, dexscreener: Dexscreener, http, store=None
 ) -> Router:
     """Assemble the venue list from configuration.
 
@@ -214,4 +252,4 @@ def build_router(
 
     venues.append(PaperVenue(dexscreener, strategy))
     native = {Chain.ROBINHOOD_CHAIN: settings.rh_chain_weth} if settings.rh_chain_weth else {}
-    return Router(venues, dexscreener, strategy, native_addresses=native)
+    return Router(venues, dexscreener, strategy, native_addresses=native, store=store)
