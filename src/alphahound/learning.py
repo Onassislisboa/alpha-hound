@@ -346,6 +346,7 @@ def relax_costly_gates(
         "liquidity": ("gates.min_liquidity_usd", -0.10),
         "holders": ("gates.min_holder_count", -0.10),
         "unknown_whale": ("gates.max_unknown_top1_pct", 0.10),
+        "top10": ("gates.max_top10_pct", 0.10),
         "bundle": ("gates.max_bundle_pct", 0.10),
         "fresh_wallets": ("gates.max_fresh_wallet_pct", 0.10),
         "crowd_already_here": ("terminals.max_retail_terminal_share", 0.10),

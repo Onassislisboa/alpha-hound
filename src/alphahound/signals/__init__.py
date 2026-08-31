@@ -15,6 +15,7 @@ Two rules hold throughout:
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -28,6 +29,7 @@ from ..store import Store
 from . import chart, flow, terminals, whales
 from .distribution import HolderStats, analyze, holder_growth
 from .terminals import Attribution, ShareTracker, TerminalRegistry
+from .whales import who_inside
 
 if TYPE_CHECKING:
     # Providers and the chain reader pull in httpx. They are only ever passed
@@ -60,6 +62,8 @@ class Enrichment:
     # unknown feature abstain rather than pass.
     unknown: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
+    crowd: dict = field(default_factory=dict)
+    twitter: dict = field(default_factory=dict)
 
 
 class Enricher:
@@ -112,6 +116,8 @@ class Enricher:
         candidate.created_at_ms = candidate.created_at_ms or snap.created_at_ms
         candidate.symbol = candidate.symbol or snap.symbol
         candidate.dex_id = candidate.dex_id or snap.dex_id
+        candidate.ret_5m = snap.price_change_m5
+        snap.stamp(candidate)
         return snap
 
     @staticmethod
@@ -126,9 +132,17 @@ class Enricher:
         by a number already in hand.
         """
         result = Enrichment(candidate=candidate, features=Features())
-        measured = {"liquidity_usd", "liq_to_mcap"}
+        measured = {"liquidity_usd", "liq_to_mcap", "dex_profile"}
         if candidate.created_at_ms:
             measured.add("token_age_minutes")
+        pack = {
+            "is_vamp": 1.0 if candidate.pack_role == "vamp" else 0.0,
+            "is_beta": 1.0 if candidate.pack_role == "beta" else 0.0,
+            "is_main": 1.0 if candidate.pack_role == "main" else 0.0,
+            "main_ret_5m": candidate.main_ret_5m,
+        }
+        if candidate.pack_role:
+            measured.update(pack)
         result.unknown.update(set(Features.names()) - measured)
         result.features = Features(
             liquidity_usd=candidate.liquidity_usd,
@@ -136,6 +150,8 @@ class Enricher:
                 candidate.liquidity_usd / candidate.mcap_usd if candidate.mcap_usd > 0 else 0.0
             ),
             token_age_minutes=candidate.age_minutes,
+            dex_profile=candidate.dex_profile,
+            **pack,
         )
         return result
 
@@ -148,9 +164,14 @@ class Enricher:
             result.notes.append("no market data from dexscreener")
 
         values: dict[str, float] = {}
-        values.update(await self._chart_features(candidate, snap, result))
-        values.update(await self._onchain_features(candidate, result))
-        values.update(await self._cost_features(candidate, probe_size_usd, result))
+        chart_f, chain_f, cost_f = await asyncio.gather(
+            self._chart_features(candidate, snap, result),
+            self._onchain_features(candidate, result),
+            self._cost_features(candidate, probe_size_usd, result),
+        )
+        values.update(chart_f)
+        values.update(chain_f)
+        values.update(cost_f)
 
         values["token_age_minutes"] = candidate.age_minutes
         if not candidate.created_at_ms:
@@ -160,6 +181,12 @@ class Enricher:
             candidate.liquidity_usd / candidate.mcap_usd if candidate.mcap_usd > 0 else 0.0
         )
         values.update(await self._narrative_features(candidate, result, values))
+        values["is_vamp"] = 1.0 if candidate.pack_role == "vamp" else 0.0
+        values["is_beta"] = 1.0 if candidate.pack_role == "beta" else 0.0
+        values["is_main"] = 1.0 if candidate.pack_role == "main" else 0.0
+        values["main_ret_5m"] = candidate.main_ret_5m
+        if not candidate.pack_role:
+            result.unknown.update({"is_vamp", "is_beta", "is_main", "main_ret_5m"})
 
         known = set(Features.names())
         result.features = Features(**{k: v for k, v in values.items() if k in known})
@@ -216,37 +243,61 @@ class Enricher:
         window_min = float(cfg_t.get("attribution_window_minutes", 10))
         max_txs = int(cfg_t.get("max_txs_inspected", 250))
 
-        mint = None
-        try:
-            mint = await self.solana.mint_info(candidate.address)
-        except Exception as exc:  # noqa: BLE001 - degrade, do not crash the tick
-            result.notes.append(f"mint_info failed: {exc}")
+        pool_addresses = {candidate.pool_address} if candidate.pool_address else set()
+
+        async def mint_job():
+            try:
+                return await self.solana.mint_info(candidate.address)
+            except Exception as exc:  # noqa: BLE001
+                result.notes.append(f"mint_info failed: {exc}")
+                return None
+
+        async def launch_job():
+            cached = self._launch_slots.get(candidate.address)
+            if cached is not None:
+                return cached
+            try:
+                slot = await self.solana.launch_slot(candidate.address)
+            except Exception:  # noqa: BLE001
+                slot = 0
+            self._launch_slots[candidate.address] = slot
+            return slot
+
+        async def holders_job():
+            try:
+                return await self.solana.largest_holders(
+                    candidate.address,
+                    pool_addresses=pool_addresses,
+                    deployer=candidate.deployer,
+                    resolve_ages=10,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result.notes.append(f"holders failed: {exc}")
+                return None
+
+        mint, launch_slot, holders_or_none = await asyncio.gather(
+            mint_job(), launch_job(), holders_job()
+        )
         result.mint = mint
         if mint is None:
             result.unknown.update({"mint_authority", "freeze_authority"})
-
-        launch_slot = self._launch_slots.get(candidate.address)
-        if launch_slot is None:
-            try:
-                launch_slot = await self.solana.launch_slot(candidate.address)
-            except Exception:  # noqa: BLE001
-                launch_slot = 0
-            self._launch_slots[candidate.address] = launch_slot
         if not launch_slot:
             result.unknown.add("bundle_pct")
-
-        pool_addresses = {candidate.pool_address} if candidate.pool_address else set()
-        holders = []
-        try:
-            holders = await self.solana.largest_holders(
-                candidate.address,
-                pool_addresses=pool_addresses,
-                deployer=candidate.deployer,
-                resolve_ages=10,
+        holders = holders_or_none or []
+        if holders_or_none is None:
+            result.unknown.update(
+                {
+                    "top10_pct",
+                    "top1_pct",
+                    "gini",
+                    "fresh_wallet_pct",
+                    "known_holder_pct",
+                    "dev_holding_pct",
+                    "cluster_pct",
+                    "lp_locked_pct",
+                    "bundle_pct",
+                }
             )
-        except Exception as exc:  # noqa: BLE001
-            result.notes.append(f"holders failed: {exc}")
-            result.unknown.update({"top10_pct", "top1_pct", "gini", "fresh_wallet_pct", "known_holder_pct"})
 
         stats = analyze(holders, now_ms=now_ms(), launch_slot=launch_slot or 0)
         result.holders = stats
@@ -327,12 +378,13 @@ class Enricher:
             }
         )
         values.setdefault("holder_growth_5m", 0.0)
-        if "top10_pct" not in result.unknown:
-            values.update(await self._crowd_features(candidate, holders, trades, result))
-        else:
+        values.update(await self._crowd_features(candidate, holders, trades, result))
+        if "top10_pct" in result.unknown:
             result.unknown.update(
                 {"fomo_inside", "fomo_net_flow", "whale_hold_pct", "whale_net_flow"}
             )
+            for key in ("fomo_inside", "fomo_net_flow", "whale_hold_pct", "whale_net_flow"):
+                values.pop(key, None)
         return values
 
     def _known_wallets(self, chain: Chain) -> set[str]:
@@ -352,6 +404,35 @@ class Enricher:
         result: Enrichment,
     ) -> dict[str, float]:
         values: dict[str, float] = {}
+        whale_set = crowd_addresses(self.whale_rows, "whale")
+        size_pct = float(self.strategy.get("whales.size_pct", 0.02))
+        whale = whales.crowd_read(holders, trades, whale_set, size_pct=size_pct)
+        kol_map: dict[str, str] = {}
+        for row in self.whale_rows:
+            klass = str(row.get("class") or "kol").lower()
+            if klass in {"whale", "fomo"}:
+                continue
+            addr = str(row.get("address") or "").strip()
+            if not addr:
+                continue
+            handle = str(row.get("handle") or "").strip().lstrip("@") or addr[:6]
+            key = addr.lower() if addr.startswith("0x") else addr
+            kol_map[key] = handle
+        result.crowd = {
+            "whale_n": whale.inside,
+            "whale_pct": round(whale.hold_pct, 4),
+            "whale_usd": round(whale.hold_pct * max(0.0, candidate.mcap_usd)),
+            "kols": who_inside(holders, trades, kol_map),
+            "wallets": list(dict.fromkeys([*whale.wallets, *kol_map]))[:16],
+        }
+        ignore_mcap = float(self.strategy.get("whales.ignore_mcap_usd", 50_000_000))
+        if candidate.mcap_usd > ignore_mcap > 0:
+            values["fomo_inside"] = 0.0
+            values["fomo_net_flow"] = 0.0
+            values["whale_hold_pct"] = 0.0
+            values["whale_net_flow"] = 0.0
+            result.notes.append("labeled flow ignored: mcap above accumulation floor")
+            return values
         fomo_set = crowd_addresses(self.whale_rows, "fomo")
         if self.fomo and self.fomo.enabled:
             in_token = await self.fomo.token_wallets(candidate.address, candidate.chain)
@@ -369,9 +450,6 @@ class Enricher:
         else:
             result.unknown.update({"fomo_inside", "fomo_net_flow"})
 
-        whale_set = crowd_addresses(self.whale_rows, "whale")
-        size_pct = float(self.strategy.get("whales.size_pct", 0.02))
-        whale = whales.crowd_read(holders, trades, whale_set, size_pct=size_pct)
         values["whale_hold_pct"] = whale.hold_pct
         values["whale_net_flow"] = whale.net_flow
         result.notes.append(
@@ -400,16 +478,31 @@ class Enricher:
         else:
             result.unknown.add("cluster_pct")
 
+        from ..providers import utility_hint
+
+        handle = result.snap.twitter if result.snap else ""
+        blurb = result.snap.blurb if result.snap else ""
         if self.twitter and self.twitter.enabled:
-            n = await self.twitter.mentions(candidate.symbol, candidate.address)
-            if n is None:
-                result.unknown.add("twitter_mentions")
+            read = await self.twitter.scan(
+                candidate.symbol, candidate.address, handle=handle, blurb=blurb
+            )
+            if read is None:
+                result.unknown.update({"twitter_mentions", "twitter_inst", "twitter_fresh"})
+                result.twitter = {"official": handle, "utility": utility_hint(blurb), "posts": []}
             else:
-                out["twitter_mentions"] = n
-                if n:
-                    result.notes.append(f"twitter: {n:.0f} recent mentions")
+                out["twitter_mentions"] = read.mentions
+                out["twitter_inst"] = read.inst
+                out["twitter_fresh"] = read.fresh
+                result.twitter = read.as_visor()
+                if read.mentions or read.official:
+                    result.notes.append(
+                        f"twitter: {read.mentions:.0f} ct"
+                        + (f" @{read.official}" if read.official else "")
+                        + (f" inst {read.inst:.2f}" if read.inst else "")
+                    )
         else:
-            result.unknown.add("twitter_mentions")
+            result.unknown.update({"twitter_mentions", "twitter_inst", "twitter_fresh"})
+            result.twitter = {"official": handle, "utility": utility_hint(blurb), "posts": []}
 
         out["copy_signal"] = copy_flag(
             age_minutes=candidate.age_minutes,
@@ -421,6 +514,16 @@ class Enricher:
             strategy=self.strategy,
             chain=candidate.chain,
         )
+        if result.snap is not None:
+            result.snap.stamp(candidate)
+        out["dex_profile"] = candidate.dex_profile
+        if candidate.dex_paid or candidate.dex_photo:
+            result.notes.append(
+                "dex: "
+                + ("paid" if candidate.dex_paid else "unpaid")
+                + (" · foto" if candidate.dex_photo else "")
+                + (" · alinhada" if candidate.dex_aligned else "")
+            )
         return out
 
     def _aggregate_only_features(
@@ -470,6 +573,8 @@ class Enricher:
         ratio = min(10.0, snap.buys_m5 / snap.sells_m5) if snap.sells_m5 else (3.0 if snap.buys_m5 else 1.0)
         avg = snap.volume_m5 / total if total else 0.0
         result.unknown.add("net_inflow_usd_5m")
+        # ponytail: Dexscreener m5 buys are tx counts, not unique wallets.
+        result.unknown.add("unique_buyers_5m")
         return {
             "buy_sell_ratio": ratio,
             "unique_buyers_5m": float(snap.buys_m5),

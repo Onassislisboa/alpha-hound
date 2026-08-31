@@ -60,7 +60,8 @@ def universe(settings: Settings | None, strategy: Config | None) -> dict[str, An
                 "launchpads": list(lp.get("dex_ids") or []),
                 "max_age_min": max_age_minutes(strategy, chain),
                 "copy_max_age_min": float(pb.get("copy_max_age_minutes", 25)),
-                "copy_max_mcap": float(pb.get("copy_max_mcap_usd", 400_000)),
+                "copy_max_mcap": float(pb.get("copy_max_mcap_usd", 2_000_000)),
+                "copy_min_mcap": float(pb.get("copy_min_mcap_usd", 100_000)),
                 "min_volume_5m": float(pb.get("min_volume_5m", 0) or 0),
                 "min_twitter": float(pb.get("min_twitter_mentions", 0) or 0),
                 "wallet": pubs.get(chain.value, ""),
@@ -260,16 +261,33 @@ HTML = """<!doctype html>
   .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                       padding: 6px 12px; cursor: pointer; border-radius: 6px; }
   .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
-  .wcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #050505; cursor: pointer; }
+  .wcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #050505;
+           cursor: pointer; min-height: 186px; contain: layout; }
   .wcard.on { border-color: #555; background: #0c0c0c; }
   .wcard-h { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
   .wcard .mcap { font-size: 22px; font-weight: 800; color: #fff; letter-spacing: -.03em; line-height: 1.1;
-                 font-variant-numeric: tabular-nums; }
+                 font-variant-numeric: tabular-nums; min-width: 6ch; }
   .wcard .age { font-size: 15px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
   .wcard .meta { font-size: 11px; color: var(--muted); margin: 2px 0; }
   .wcard .kols { font-size: 11px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .dex-paid { color: #3dff9a; font-weight: 800; letter-spacing: .08em; }
   .dex-no { color: #ff3b4e; font-weight: 800; letter-spacing: .08em; }
+  a.xbtn { display: inline-block; margin: 4px 0 2px; padding: 2px 8px; border: 1px solid #333;
+           border-radius: 99px; color: #3ad6ff; text-decoration: none; font-size: 11px; font-weight: 700; }
+  a.xbtn:hover { border-color: #3ad6ff; color: #fff; }
+  .score { display: flex; align-items: center; gap: 10px; margin: 6px 0 4px; }
+  .score-n { font-size: 28px; font-weight: 800; letter-spacing: -.04em; line-height: 1;
+             font-variant-numeric: tabular-nums; min-width: 2.2ch; }
+  .score-hi .score-n { color: #3dff9a; } .score-mid .score-n { color: #ffd24a; }
+  .score-lo .score-n { color: #ff3b4e; }
+  .score-bars { flex: 1; display: grid; gap: 2px; }
+  .score-bars b { display: flex; align-items: center; gap: 4px; font-size: 9px; color: #6a6a6a;
+                  font-weight: 600; letter-spacing: .04em; }
+  .score-bars b em { flex: 1; height: 3px; background: #1a1a1a; border-radius: 2px; overflow: hidden; }
+  .score-bars b i { display: block; height: 100%; background: #c8c8c8; }
+  .score-hi .score-bars i { background: #3dff9a; }
+  .score-mid .score-bars i { background: #ffd24a; }
+  .score-lo .score-bars i { background: #ff3b4e; }
   .cert-ok { color: #3dff9a; font-weight: 700; letter-spacing: .06em; }
   .cert-no { color: #ff3b4e; font-weight: 700; letter-spacing: .06em; }
   .cert-q { color: #6a6a6a; font-weight: 700; letter-spacing: .06em; }
@@ -393,13 +411,21 @@ const ageTxt = m => {
 const certHtml = c => c==='ok' ? '<span class="cert-ok">CERT OK</span>'
   : c==='no' ? '<span class="cert-no">CERT NO</span>'
   : '<span class="cert-q">CERT —</span>';
+function xHandle(h) {
+  h = String(h||'').replace(/^@/,'').trim();
+  if (!/^[A-Za-z0-9_]{1,15}$/.test(h) || /^\\d+$/.test(h)) return '';
+  return h;
+}
 function twLine(tw) {
   if (!tw || !(tw.official || (tw.posts||[]).length || tw.utility)) return '';
-  const age = tw.official_age_min == null ? '' : ' '+ageTxt(tw.official_age_min);
+  const h = xHandle(tw.official);
+  const btn = h
+    ? '<a class="xbtn" href="https://x.com/'+h+'" target="_blank" rel="noopener">@'+h+'</a>'
+    : '';
   const inst = tw.inst ? ' · inst' : '';
   const quiet = tw.official_age_min != null && tw.official_age_min > 360 ? ' quiet' : '';
-  return '<div class="meta">tw '+(tw.official?('@'+tw.official):'')+age+inst+quiet
-    +(tw.utility?' · '+tw.utility:'')+'</div>';
+  if (!btn && !inst && !quiet && !tw.utility) return '';
+  return '<div class="meta">'+btn+inst+quiet+(tw.utility?' · '+tw.utility:'')+'</div>';
 }
 function twBlock(tw) {
   if (!tw) return '';
@@ -408,18 +434,19 @@ function twBlock(tw) {
   return twLine(tw) + (posts ? '<ul>'+posts+'</ul>' : '');
 }
 function dexLine(w) {
-  const paid = w.dex_paid
-    ? '<span class="dex-paid">DEX PAID</span>'
-    : '<span class="dex-no">NOT DEX</span>';
-  const extra = [];
-  if (w.dex_photo) extra.push('foto');
-  if (w.dex_aligned) extra.push('alinhada');
-  return '<div class="meta">'+paid+(extra.length ? ' · '+extra.join(' · ') : '')+'</div>';
+  return w.dex_paid
+    ? '<div class="meta"><span class="dex-paid" data-f="dex">DEX PAID</span></div>'
+    : '<div class="meta"><span class="dex-no" data-f="dex">NOT DEX</span></div>';
 }
 function rubricLine(r) {
   if (!r || r.total == null) return '';
-  return '<div class="meta">score '+r.total
-    +' · d'+r.dist+' c'+r.crowd+' f'+r.flow+' g'+r.chart+' n'+r.narrative+'</div>';
+  const tone = r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
+  const row = (k, v) => '<b>'+k+'<em><i data-k="'+k+'" style="width:'+Math.max(0,Math.min(100,Math.round((v/10)*100)))+'%"></i></em></b>';
+  return '<div class="score score-'+tone+'" data-f="score">'
+    + '<span class="score-n" data-f="score-n">'+r.total+'</span>'
+    + '<div class="score-bars">'
+    + row('D', r.dist)+row('C', r.crowd)+row('F', r.flow)+row('G', r.chart)+row('N', r.narrative)
+    + '</div></div>';
 }
 const mins = n => ageTxt(n);
 const caHead = a => (a||'').slice(0, 6);
@@ -432,14 +459,16 @@ let inflight = false;
 
 function watchKey(w) { return w.chain+':'+w.address; }
 function watchSig(w) {
-  const r = w.rubric || {};
-  return [w.symbol, w.call, w.cert, w.label, w.role, w.dex_paid, w.dex_photo, w.dex_aligned,
-    (w.kols||[]).join(','), w.tw && w.tw.official, r.total, w.whale_n].join('|');
+  return [w.symbol, w.call, w.cert, w.label, w.role,
+    (w.kols||[]).join(','), w.tw && w.tw.official, w.rubric ? 1 : 0, w.whale_n==null?0:1].join('|');
 }
 function watchBody(w) {
   const call = w.call || 'scan';
+  const skipHint = (call==='skip' && w.label==='unverified')
+    ? 'holders da Solana nao medidos. Precisa Helius/RPC.'
+    : '';
   const pill = w.label
-    ? '<span class="pill v-'+w.label+'">'+call.toUpperCase()+' '+w.label+'</span>'
+    ? '<span class="pill v-'+w.label+'"'+(skipHint?' title="'+skipHint+'"':'')+'>'+call.toUpperCase()+' '+w.label+'</span>'
     : '<span class="pill st-'+call+'">'+call.toUpperCase()+'</span>';
   const whales = w.whale_n == null
     ? ''
@@ -463,6 +492,24 @@ function fillLive(el, w) {
   };
   set('mcap', '$'+kM(w.mcap));
   set('age', ageTxt(w.age_min));
+  const dex = el.querySelector('[data-f="dex"]');
+  if (dex) {
+    dex.className = w.dex_paid ? 'dex-paid' : 'dex-no';
+    const t = w.dex_paid ? 'DEX PAID' : 'NOT DEX';
+    if (dex.textContent !== t) dex.textContent = t;
+  }
+  const r = w.rubric;
+  const score = el.querySelector('[data-f="score"]');
+  if (r && r.total != null && score) {
+    const tone = r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
+    score.className = 'score score-'+tone;
+    set('score-n', String(r.total));
+    const wmap = {D:r.dist, C:r.crowd, F:r.flow, G:r.chart, N:r.narrative};
+    score.querySelectorAll('i[data-k]').forEach(i => {
+      const pct = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
+      i.style.width = pct+'%';
+    });
+  }
   const ret = el.querySelector('[data-f="ret"]');
   if (ret) {
     ret.className = cls(w.ret_5m);
@@ -492,14 +539,13 @@ function paintWatch(list, running) {
       el.dataset.pick = key;
       el.innerHTML = watchBody(w);
       el.dataset.sig = sig;
+      box.appendChild(el);
     } else if (el.dataset.sig !== sig) {
       el.innerHTML = watchBody(w);
       el.dataset.sig = sig;
     } else {
       fillLive(el, w);
     }
-    const at = box.children[i];
-    if (at !== el) box.insertBefore(el, at || null);
   });
   have.forEach((el, key) => { if (!keep.has(key)) el.remove(); });
 }
@@ -562,7 +608,7 @@ function chainCard(c) {
   const extra = [];
   if (c.min_volume_5m) extra.push('vol ≥ '+kM(c.min_volume_5m));
   if (c.min_twitter) extra.push('twitter ≥ '+c.min_twitter);
-  extra.push('copy <'+Math.round(c.copy_max_age_min)+' min · '+kM(c.copy_max_mcap));
+  extra.push('mcap ≥ '+kM(c.copy_min_mcap||100000)+' · <'+kM(c.copy_max_mcap));
   return `<div class="card ${c.enabled?'':'off'}">
     <h2>${c.chain} ${c.enabled?'<span class="pill on">on</span>':'<span class="pill">off</span>'}</h2>
     <p>${pads} · max ${Math.round(c.max_age_min)} min</p>
@@ -607,7 +653,7 @@ document.addEventListener('click', e => {
     return;
   }
   const pick = e.target.closest('[data-pick]');
-  if (pick && !e.target.closest('[data-copy]')) {
+  if (pick && !e.target.closest('[data-copy]') && !e.target.closest('a')) {
     picked = pick.dataset.pick;
     paintCoin();
     return;

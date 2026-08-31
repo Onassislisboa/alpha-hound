@@ -114,6 +114,24 @@ class Candidate:
     source: str = ""
     dex_id: str = ""
     discovered_at_ms: int = field(default_factory=now_ms)
+    ret_5m: float = 0.0
+    last_scored_ms: int = 0
+    pack_role: str = ""
+    pack_stem: str = ""
+    main_key: str = ""
+    main_ret_5m: float = 0.0
+    pack_size: int = 1
+    dex_paid: bool = False
+    dex_photo: bool = False
+    dex_aligned: bool = False
+
+    @property
+    def dex_profile(self) -> float:
+        return (
+            (0.50 if self.dex_paid else 0.0)
+            + (0.30 if self.dex_photo else 0.0)
+            + (0.20 if self.dex_aligned else 0.0)
+        )
 
     @property
     def key(self) -> str:
@@ -190,8 +208,19 @@ class Features:
     cluster_pct: float = 0.0
     # Recent CT mentions of the CA / $ticker. 0 with a key means silence.
     twitter_mentions: float = 0.0
+    # Max institutional/shill weight from those mentions (0–1).
+    twitter_inst: float = 0.0
+    # 1 if a qualifying account posted in the last ~30 minutes.
+    twitter_fresh: float = 0.0
     # 1 if labeled smart/Fomo is buying a still-young, still-small launch.
     copy_signal: float = 0.0
+    # Paid Dexscreener boost + photo + branded profile. 0–1, not a veto.
+    dex_profile: float = 0.0
+    # Pack: main runner / beta / vamp. Floats so they sit in the feature vector.
+    is_vamp: float = 0.0
+    is_beta: float = 0.0
+    is_main: float = 0.0
+    main_ret_5m: float = 0.0
 
     # --- liquidity / microstructure ---------------------------------------
     liquidity_usd: float = 0.0
@@ -225,6 +254,8 @@ class Score:
     # you cannot tell a good model from a lucky one.
     contributions: dict[str, float] = field(default_factory=dict)
     veto_reasons: list[str] = field(default_factory=list)
+    dist: dict = field(default_factory=dict)
+    rubric: dict = field(default_factory=dict)
 
     @property
     def vetoed(self) -> bool:
@@ -325,6 +356,13 @@ class Position:
     # Unique buy wallets seen at entry. Credited as smart money if the trade
     # later wins; a rug does not promote them.
     entry_buyers: list[str] = field(default_factory=list)
+    entry_sponsors: list[str] = field(default_factory=list)
+    entry_rubric: float = 0.0
+    hold_strikes: int = 0
+    last_hold_ms: int = 0
+    last_hold_rubric: float = 0.0
+    last_hold_why: str = ""
+    entry_mcap_usd: float = 0.0
 
     def __post_init__(self) -> None:
         if self.tokens_remaining == 0.0:
@@ -373,6 +411,9 @@ class TradeRecord:
     # See Decision.unknown: the trainer must not learn from a value that was
     # never measured.
     unknown: set[str] = field(default_factory=set)
+    symbol: str = ""
+    mcap_entry_usd: float = 0.0
+    mcap_exit_usd: float = 0.0
 
     @property
     def pnl_pct(self) -> float:

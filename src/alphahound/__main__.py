@@ -74,7 +74,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     store = Store(settings.state_dir)
     registry = build_registry(store, terminals)
 
-    print(f"alpha-hound {__version__}")
+    print(f"FirstKill {__version__}")
     print(f"  mode              {settings.mode}")
     print(f"  chains            {', '.join(c.value for c in settings.enabled_chains)}")
     print(f"  state             {store.path}")
@@ -214,14 +214,16 @@ def cmd_trades(args: argparse.Namespace) -> int:
         return 0
     print(
         f"{'symbol/key':<26} {'venue':<10} {'size':>8} {'pnl':>9} {'pnl%':>8} "
-        f"{'exit':<16} {'class':<18} {'mfe':>7}"
+        f"{'mcap in':>8} {'mcap out':>8} {'exit':<16} {'class':<18}"
     )
     for trade in trades:
         _, _, address = trade.key.partition(":")
+        label = (trade.symbol or address)[:24]
         print(
-            f"{address[:24]:<26} {trade.venue.value:<10} {trade.size_usd:>8.2f} "
-            f"{trade.pnl_usd:>+9.2f} {trade.pnl_pct:>+8.1%} {trade.exit_reason.value:<16} "
-            f"{trade.error_class.value:<18} {trade.max_favorable_excursion:>+7.1%}"
+            f"{label:<26} {trade.venue.value:<10} {trade.size_usd:>8.2f} "
+            f"{trade.pnl_usd:>+9.2f} {trade.pnl_pct:>+8.1%} "
+            f"{trade.mcap_entry_usd:>8.0f} {trade.mcap_exit_usd:>8.0f} "
+            f"{trade.exit_reason.value:<16} {trade.error_class.value:<18}"
         )
     total = sum(t.pnl_usd for t in trades)
     wins = sum(1 for t in trades if t.won)

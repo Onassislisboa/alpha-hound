@@ -28,6 +28,15 @@ def _window(trades: list[Trade], now_ms: int, minutes: float) -> list[Trade]:
     return [t for t in trades if t.ts_ms >= cutoff]
 
 
+def wash_ratio(trades: list[Trade]) -> float:
+    """1.0 = few wallets cycling many buys (wash). 0 = each buy a new wallet."""
+    buys = [t for t in trades if t.side is Side.BUY]
+    if len(buys) < 4:
+        return 0.0
+    unique = unique_buyers(buys)
+    return max(0.0, 1.0 - unique / len(buys))
+
+
 def unique_buyers(trades: list[Trade]) -> int:
     return len({t.wallet for t in trades if t.side is Side.BUY and t.wallet})
 

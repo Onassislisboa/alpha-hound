@@ -83,7 +83,10 @@ CREATE TABLE IF NOT EXISTS trades (
     features TEXT NOT NULL,
     weights_version INTEGER NOT NULL,
     notes TEXT,
-    unknown TEXT NOT NULL DEFAULT '[]'
+    unknown TEXT NOT NULL DEFAULT '[]',
+    symbol TEXT NOT NULL DEFAULT '',
+    mcap_entry_usd REAL NOT NULL DEFAULT 0,
+    mcap_exit_usd REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_at_ms);
 
@@ -201,6 +204,9 @@ class Store:
         for table, column, ddl in (
             ("decisions", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
             ("trades", "unknown", "TEXT NOT NULL DEFAULT '[]'"),
+            ("trades", "symbol", "TEXT NOT NULL DEFAULT ''"),
+            ("trades", "mcap_entry_usd", "REAL NOT NULL DEFAULT 0"),
+            ("trades", "mcap_exit_usd", "REAL NOT NULL DEFAULT 0"),
         ):
             existing = {
                 r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -290,8 +296,8 @@ class Store:
             """INSERT INTO trades (key, chain, venue, opened_at_ms, closed_at_ms,
                    entry_price, exit_price, signal_price, size_usd, pnl_usd, fees_usd,
                    exit_reason, error_class, mfe, mae, entry_slippage, features,
-                   weights_version, notes, unknown)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   weights_version, notes, unknown, symbol, mcap_entry_usd, mcap_exit_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 trade.key,
                 trade.chain.value,
@@ -313,6 +319,9 @@ class Store:
                 trade.weights_version,
                 trade.notes,
                 json.dumps(sorted(trade.unknown)),
+                trade.symbol,
+                trade.mcap_entry_usd,
+                trade.mcap_exit_usd,
             ),
         )
         return int(cur.lastrowid or 0)
@@ -350,6 +359,9 @@ class Store:
             weights_version=row["weights_version"],
             notes=row["notes"] or "",
             unknown=unknown_from_json(row["unknown"]),
+            symbol=row["symbol"] if "symbol" in row.keys() else "",
+            mcap_entry_usd=float(row["mcap_entry_usd"] or 0) if "mcap_entry_usd" in row.keys() else 0.0,
+            mcap_exit_usd=float(row["mcap_exit_usd"] or 0) if "mcap_exit_usd" in row.keys() else 0.0,
         )
 
     def trade_count(self) -> int:
@@ -493,6 +505,20 @@ class Store:
             "SELECT address FROM wallets WHERE chain = ? AND is_smart = 1", (chain.value,)
         ).fetchall()
         return {r["address"] for r in rows}
+
+    def wallet_record(self, address: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT trades, wins, pnl_usd, is_smart FROM wallets WHERE address = ?",
+            (address,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "trades": int(row["trades"]),
+            "wins": int(row["wins"]),
+            "pnl_usd": float(row["pnl_usd"]),
+            "is_smart": bool(row["is_smart"]),
+        }
 
     def record_buyer_outcome(self, address: str, chain: Chain, pnl_usd: float) -> None:
         """Promote a wallet to smart money only after it shows up on winners.

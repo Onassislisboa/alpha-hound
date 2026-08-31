@@ -97,6 +97,40 @@ def volume_zscore(candles: list[Candle], window: int = 20) -> float:
     return max(-5.0, min(5.0, (candles[-1].volume - mu) / sd))
 
 
+def upper_wick(candles: list[Candle]) -> float:
+    """Share of the last candle's range that is upper wick. Rejection at highs."""
+    if not candles:
+        return 0.0
+    c = candles[-1]
+    rng = c.high - c.low
+    if rng <= 0:
+        return 0.0
+    return max(0.0, (c.high - max(c.open, c.close)) / rng)
+
+
+def higher_lows(candles: list[Candle], n: int = 4) -> float:
+    """1.0 if the last n lows are non-decreasing (accumulation). 0 if collapsing."""
+    if len(candles) < n:
+        return 0.0
+    lows = [c.low for c in candles[-n:]]
+    steps = list(zip(lows, lows[1:]))
+    if not steps:
+        return 0.0
+    return sum(1.0 for a, b in steps if b >= a * 0.998) / len(steps)
+
+
+def last_range_vs_atr(candles: list[Candle]) -> float:
+    """Last candle range / own ATR. >2 is a spike relative to this token, not a global cap."""
+    if len(candles) < 3:
+        return 1.0
+    c = candles[-1]
+    rng = c.high - c.low
+    unit = atr_pct(candles[:-1] or candles) * (c.close or 1.0)
+    if unit <= 0:
+        return 1.0
+    return rng / unit
+
+
 def body_ratio(candles: list[Candle]) -> float:
     """Signed conviction of the last candle: how much of the range the body
     took. A long upper wick on huge volume is distribution wearing a green

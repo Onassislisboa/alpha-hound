@@ -14,9 +14,12 @@ token with four holders.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from .log import get
 from .models import Candidate, Candle, Chain, now_ms
@@ -55,6 +58,11 @@ class PairSnapshot:
     created_at_ms: int
     dex_id: str = ""
     quote_symbol: str = ""
+    twitter: str = ""
+    blurb: str = ""
+    dex_paid: bool = False
+    dex_photo: bool = False
+    dex_aligned: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_candidate(self, source: str) -> Candidate:
@@ -72,7 +80,18 @@ class PairSnapshot:
             quote_asset=self.quote_symbol,
             source=source,
             dex_id=self.dex_id,
+            ret_5m=self.price_change_m5,
+            dex_paid=self.dex_paid or source == "dexscreener_boosts",
+            dex_photo=self.dex_photo,
+            dex_aligned=self.dex_aligned,
         )
+
+    def stamp(self, candidate: Candidate) -> None:
+        candidate.dex_paid = (
+            candidate.dex_paid or self.dex_paid or candidate.source == "dexscreener_boosts"
+        )
+        candidate.dex_photo = self.dex_photo
+        candidate.dex_aligned = self.dex_aligned
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -82,6 +101,123 @@ def _f(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def orders_mark_paid(data: Any) -> bool:
+    """Dexscreener /orders/v1: approved profile or boost = they paid."""
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = list(data.get("orders") or []) + list(data.get("boosts") or [])
+    else:
+        return False
+    return any(
+        isinstance(row, dict) and str(row.get("status") or "").lower() == "approved"
+        for row in rows
+    )
+
+
+def pair_dex_flags(pair: dict[str, Any]) -> tuple[bool, bool, bool]:
+    """Paid Dexscreener boost + photo + branded profile. Rugs rarely pay."""
+    info = pair.get("info") or {}
+    boosts = pair.get("boosts") or {}
+    paid = (
+        _f(boosts.get("active")) > 0
+        or _f(boosts.get("amount")) > 0
+        or bool(str(info.get("header") or "").strip())
+    )
+    photo = bool(str(info.get("imageUrl") or info.get("header") or "").strip())
+    handle, blurb = pair_socials(pair)
+    websites = bool(info.get("websites"))
+    ticker = str((pair.get("baseToken") or {}).get("symbol") or "").lower().lstrip("$")
+    name = str((pair.get("baseToken") or {}).get("name") or "").lower()
+    blob = f"{blurb} {handle}".lower()
+    named = bool(ticker) and (
+        ticker in blob or (len(name) >= 3 and name.split()[0] in blob)
+    )
+    aligned = photo and bool(handle or websites) and bool(blurb.strip()) and named
+    return paid, photo, aligned
+
+
+_X_SKIP = frozenset(
+    {
+        "home",
+        "search",
+        "i",
+        "intent",
+        "share",
+        "hashtag",
+        "explore",
+        "compose",
+        "login",
+        "signup",
+        "communities",
+        "status",
+        "statuses",
+        "tweet",
+        "jobs",
+        "privacy",
+        "tos",
+        "settings",
+    }
+)
+_HANDLE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+
+
+def twitter_handle(url: str) -> str:
+    """Profile handle from an X/Twitter URL. Tweet ids and /i/communities 404."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if "twitter.com/" not in low and "x.com/" not in low:
+        h = raw.lstrip("@")
+        return h if _HANDLE.fullmatch(h) and not h.isdigit() else ""
+    parsed = urlparse(raw if "://" in raw else "https://" + raw)
+    parts = [p for p in parsed.path.split("/") if p]
+    if not parts or parts[0].lower() in _X_SKIP:
+        return ""
+    h = parts[0].lstrip("@")
+    return h if _HANDLE.fullmatch(h) and not h.isdigit() else ""
+
+
+def pair_socials(pair: dict[str, Any]) -> tuple[str, str]:
+    """Dexscreener profile twitter handle + blurb. Free, no X key."""
+    info = pair.get("info") or {}
+    blurb = str(info.get("description") or "")[:240]
+    handle = ""
+    for row in info.get("socials") or []:
+        got = twitter_handle(str((row or {}).get("url") or ""))
+        if got:
+            handle = got
+            break
+    return handle, blurb
+
+
+def inst_weight(followers: int, verified_type: str = "") -> float:
+    """0–1. Business/gov and 50k+ CT accounts are the shill that moves a mint."""
+    v = (verified_type or "").lower()
+    score = 0.85 if v in {"business", "government"} else 0.0
+    if followers >= 500_000:
+        score = max(score, 1.0)
+    elif followers >= 100_000:
+        score = max(score, 0.75)
+    elif followers >= 50_000:
+        score = max(score, 0.55)
+    elif followers >= 10_000:
+        score = max(score, 0.25)
+    return score
+
+
+def utility_hint(*texts: str) -> str:
+    blob = " ".join(t for t in texts if t).lower()
+    if not blob:
+        return ""
+    if any(w in blob for w in ("stake", "game", "nft", "defi", "dao", "ai agent", "utility")):
+        return "claims utility"
+    if any(w in blob for w in ("meme", "just a", "culture")):
+        return "meme"
+    return ""
+
+
 def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
     slug = pair.get("chainId", "")
     chain = SLUG_TO_CHAIN.get(slug)
@@ -89,6 +225,8 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
         return None
     base = pair.get("baseToken") or {}
     txns = (pair.get("txns") or {}).get("m5") or {}
+    twitter, blurb = pair_socials(pair)
+    paid, photo, aligned = pair_dex_flags(pair)
     return PairSnapshot(
         chain=chain,
         pair_address=pair.get("pairAddress", ""),
@@ -107,6 +245,11 @@ def parse_pair(pair: dict[str, Any]) -> PairSnapshot | None:
         created_at_ms=int(_f(pair.get("pairCreatedAt"))),
         dex_id=pair.get("dexId", ""),
         quote_symbol=(pair.get("quoteToken") or {}).get("symbol", ""),
+        twitter=twitter,
+        blurb=blurb,
+        dex_paid=paid,
+        dex_photo=photo,
+        dex_aligned=aligned,
         raw=pair,
     )
 
@@ -125,7 +268,8 @@ class Dexscreener:
         # Documented as 300 req/min for the pairs endpoints. Staying under it
         # deliberately, because being rate-limited during a launch is the one
         # moment the data is worth anything.
-        http.limit("api.dexscreener.com", rate_per_sec=3.0, burst=6)
+        http.limit("api.dexscreener.com", rate_per_sec=5.0, burst=8)
+        self._paid: dict[str, tuple[float, bool]] = {}
 
     async def _get(self, path: str, **kw: Any) -> Any:
         try:
@@ -186,6 +330,22 @@ class Dexscreener:
             if slug in SLUG_TO_CHAIN and address:
                 out.append(address)
         return out
+
+    async def token_is_paid(self, chain: Chain, address: str) -> bool:
+        """Profile/boost order, cached. Pair.boosts.active misses paid listings."""
+        now = time.monotonic()
+        hit = self._paid.get(address)
+        if hit is not None and now - hit[0] < 45:
+            return hit[1]
+        slug = DEX_CHAIN_SLUG.get(chain)
+        if not slug or not address:
+            return False
+        data = await self._get(f"/orders/v1/{slug}/{address}")
+        if data is None:
+            return False
+        paid = orders_mark_paid(data)
+        self._paid[address] = (now, paid)
+        return paid
 
     async def boosted(self) -> list[str]:
         """Paid-boost tokens. Included as a signal about the *promoter*, not the
@@ -400,55 +560,165 @@ _TWITTER_SKIP = frozenset(
 )
 
 
-class Twitter:
-    """Recent mention counts. Needs TWITTER_BEARER_TOKEN (X API v2).
+@dataclass(slots=True)
+class TweetRead:
+    mentions: float = 0.0
+    inst: float = 0.0
+    fresh: float = 0.0
+    official: str = ""
+    official_age_min: float | None = None
+    posts: list[dict[str, Any]] = field(default_factory=list)
+    utility: str = ""
 
-    Light narrative check: is CT talking about this CA / $ticker in the last
-    couple of hours. Not a sentiment model.
+    def as_visor(self) -> dict[str, Any]:
+        return {
+            "official": self.official,
+            "official_age_min": self.official_age_min,
+            "inst": round(self.inst, 2),
+            "fresh": round(self.fresh, 2),
+            "mentions": int(self.mentions),
+            "utility": self.utility,
+            "posts": self.posts[:5],
+        }
+
+
+def _tweet_age_min(iso: str) -> float | None:
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0.0, (now_ms() - ts.timestamp() * 1000) / 60_000.0)
+
+
+class Twitter:
+    """Light X search: CA / $ticker / official handle. Needs TWITTER_BEARER_TOKEN.
+
+    Few trades a day, so one recent-search per scored mint is the budget.
     """
 
     def __init__(self, http: Http, bearer: str = "") -> None:
         self.http = http
         self.bearer = bearer
         http.limit("api.x.com", rate_per_sec=0.15, burst=2)
-        self._cache: dict[str, tuple[float, float]] = {}
+        self._cache: dict[str, tuple[float, TweetRead | None]] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.bearer)
 
-    def _query(self, symbol: str, address: str) -> str:
+    def _query(self, symbol: str, address: str, handle: str = "") -> str:
         parts: list[str] = []
         if address and len(address) >= 32:
             parts.append(address)
         sym = (symbol or "").lstrip("$").strip()
         if sym and 3 <= len(sym) <= 12 and sym.upper() not in _TWITTER_SKIP and sym.isascii():
             parts.append(f"${sym}")
+        h = handle.lstrip("@")
+        if h and h.replace("_", "").isalnum() and len(h) <= 15:
+            parts.append(f"from:{h}")
         return " OR ".join(parts)
 
     async def mentions(self, symbol: str, address: str) -> float | None:
+        read = await self.scan(symbol, address)
+        return None if read is None else read.mentions
+
+    async def scan(
+        self, symbol: str, address: str, *, handle: str = "", blurb: str = ""
+    ) -> TweetRead | None:
         if not self.enabled:
             return None
-        q = self._query(symbol, address)
+        q = self._query(symbol, address, handle)
         if not q:
-            return 0.0
+            return TweetRead(official=handle.lstrip("@"), utility=utility_hint(blurb))
         now = time.monotonic()
         cached = self._cache.get(q)
         if cached and now - cached[0] < 90:
             return cached[1]
         try:
             data = await self.http.get(
-                "https://api.x.com/2/tweets/counts/recent",
-                params={"query": q, "granularity": "hour"},
+                "https://api.x.com/2/tweets/search/recent",
+                params={
+                    "query": f"({q}) -is:retweet",
+                    "max_results": "20",
+                    "expansions": "author_id",
+                    "tweet.fields": "created_at,text",
+                    "user.fields": "verified,verified_type,public_metrics,username",
+                },
                 headers={"Authorization": f"Bearer {self.bearer}"},
             )
         except HttpError as exc:
-            log.debug("twitter counts failed", extra={"status": exc.status})
+            log.debug("twitter search failed", extra={"status": exc.status})
             return None
-        buckets = (data or {}).get("data") or []
-        total = sum(_f(b.get("tweet_count")) for b in buckets[-2:])
-        self._cache[q] = (now, total)
-        return total
+        users = {
+            str(u.get("id")): u
+            for u in ((data or {}).get("includes") or {}).get("users") or []
+        }
+        official = handle.lstrip("@").lower()
+        seen: set[str] = set()
+        n = 0.0
+        inst = 0.0
+        fresh = 0.0
+        official_age: float | None = None
+        posts: list[dict[str, Any]] = []
+        texts: list[str] = [blurb]
+        for tw in (data or {}).get("data") or []:
+            uid = str(tw.get("author_id") or "")
+            user = users.get(uid) or {}
+            uname = str(user.get("username") or "")
+            followers = int((user.get("public_metrics") or {}).get("followers_count") or 0)
+            vtype = str(user.get("verified_type") or "")
+            verified = bool(user.get("verified")) or bool(vtype)
+            age = _tweet_age_min(str(tw.get("created_at") or ""))
+            text = str(tw.get("text") or "").replace("\n", " ")[:140]
+            if official and uname.lower() == official and age is not None:
+                official_age = age if official_age is None else min(official_age, age)
+                if age < 30:
+                    fresh = max(fresh, 1.0)
+                elif age < 90:
+                    fresh = max(fresh, 0.5)
+                if text and not any(p.get("handle", "").lower() == official for p in posts):
+                    posts.append(
+                        {
+                            "handle": uname,
+                            "followers": followers,
+                            "age_min": round(age, 1),
+                            "text": text,
+                        }
+                    )
+            if uid and uid not in seen and verified and followers >= 1000:
+                seen.add(uid)
+                n += 1.0
+                inst = max(inst, inst_weight(followers, vtype))
+                if age is not None and age < 30:
+                    fresh = max(fresh, 1.0)
+                elif age is not None and age < 90:
+                    fresh = max(fresh, 0.5)
+                if not any(p.get("handle", "").lower() == uname.lower() for p in posts):
+                    posts.append(
+                        {
+                            "handle": uname,
+                            "followers": followers,
+                            "age_min": None if age is None else round(age, 1),
+                            "text": text,
+                        }
+                    )
+            texts.append(text)
+        posts.sort(key=lambda p: -(p.get("followers") or 0))
+        read = TweetRead(
+            mentions=n,
+            inst=inst,
+            fresh=fresh,
+            official=handle.lstrip("@"),
+            official_age_min=official_age,
+            posts=posts[:5],
+            utility=utility_hint(*texts),
+        )
+        self._cache[q] = (now, read)
+        return read
 
 
 class Bubblemaps:

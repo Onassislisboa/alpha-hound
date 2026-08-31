@@ -31,7 +31,6 @@ from dataclasses import dataclass, field
 from .log import get
 from .models import Candidate, Chain, now_ms
 from .origin import launchpad_origin
-from .playbook import max_age_minutes as pb_max_age
 from .providers import DEX_CHAIN_SLUG, Dexscreener
 from .settings import Config, Settings
 
@@ -78,8 +77,10 @@ class Discovery:
                 await task
         self._tasks.clear()
 
-    def watch(self, chain: Chain, address: str) -> None:
-        self._watchlist.add(f"{chain.value}:{address}")
+    def watch(self, address: str) -> None:
+        a = address.strip()
+        if a:
+            self._watchlist.add(a)
 
     # -- polling -----------------------------------------------------------
     async def poll(self) -> list[Candidate]:
@@ -101,10 +102,9 @@ class Discovery:
                     sources[address] = source
                     addresses.append(address)
 
-        for entry in self._watchlist:
-            _, _, address = entry.partition(":")
+        for address in self._watchlist:
             if address and address not in sources:
-                sources[address] = "watchlist"
+                sources[address] = "inspect"
                 addresses.append(address)
 
         out: list[Candidate] = []
@@ -136,14 +136,15 @@ class Discovery:
             return False
         if not candidate.address:
             return False
-        allowed, _reason = launchpad_origin(candidate, self.strategy)
-        if not allowed:
-            return False
-
-        age = candidate.age_minutes
-        if not candidate.created_at_ms or age > pb_max_age(self.strategy, candidate.chain):
-            self.stats.dropped_stale += 1
-            return False
+        # Operator paste: keep even if the mint is older than the playbook window.
+        if candidate.source != "inspect":
+            allowed, _reason = launchpad_origin(candidate, self.strategy)
+            if not allowed:
+                return False
+            cap = float(self.strategy.get("loop.max_candidate_age_minutes", 180))
+            if not candidate.created_at_ms or candidate.age_minutes > cap:
+                self.stats.dropped_stale += 1
+                return False
 
         last = self._seen.get(candidate.key, 0)
         # Re-emit a known candidate at most once a minute: the engine wants

@@ -31,6 +31,7 @@ class CrowdRead:
     hold_pct: float = 0.0
     buy_usd: float = 0.0
     sell_usd: float = 0.0
+    wallets: tuple[str, ...] = ()
 
     @property
     def net_flow(self) -> float:
@@ -79,7 +80,35 @@ def crowd_read(
         hold_pct=sum(members.values()),
         buy_usd=buy,
         sell_usd=sell,
+        wallets=tuple(members),
     )
+
+
+def who_inside(
+    holders: list[Holder],
+    trades: list[Trade],
+    labeled: dict[str, str],
+) -> list[str]:
+    """Handles from `labeled` (norm-addr → name) found in holders or recent flow."""
+    names: list[str] = []
+    seen: set[str] = set()
+    circ = sorted(
+        (h for h in holders if not (h.is_lp or h.is_burn or h.is_deployer)),
+        key=lambda h: -h.balance,
+    )
+    for h in circ:
+        key = _norm(h.address)
+        if key in labeled and key not in seen:
+            seen.add(key)
+            names.append(labeled[key])
+    for t in trades:
+        if not t.wallet:
+            continue
+        key = _norm(t.wallet)
+        if key in labeled and key not in seen:
+            seen.add(key)
+            names.append(labeled[key])
+    return names
 
 
 def wallets_in(obj: Any, *, skip: set[str] | None = None) -> set[str]:

@@ -23,13 +23,16 @@ from statistics import fmean, median
 from typing import TYPE_CHECKING
 
 from .log import get
-from .models import Features, Score, TradeRecord
+from .models import Features, Position, Score, TradeRecord, now_ms
+from .verdict import bot_veto, classify
 from .portfolio import banked_from_peak
 from .settings import Config
 from .origin import launchpad_origin
 from .playbook import gate as pb_gate
 from .playbook import max_age_minutes as pb_max_age
+from .playbook import section as pb_section
 from .store import Store
+from .rubric import grade
 
 if TYPE_CHECKING:
     # Import-time only. Keeps the scoring path free of the HTTP stack so the
@@ -107,7 +110,14 @@ NORMALIZERS: dict[str, object] = {
     "whale_net_flow": lambda x: _clip(x, -1.0, 1.0),
     "cluster_pct": lambda x: _clip(x, 0.0, 1.0),
     "twitter_mentions": _log_center(0.7, 0.8),
+    "twitter_inst": lambda x: _clip(x, 0.0, 1.0),
+    "twitter_fresh": lambda x: _clip(x, 0.0, 1.0),
     "copy_signal": lambda x: _clip(x, 0.0, 1.0),
+    "dex_profile": lambda x: _clip(x, 0.0, 1.0),
+    "is_vamp": lambda x: _clip(x, 0.0, 1.0),
+    "is_beta": lambda x: _clip(x, 0.0, 1.0),
+    "is_main": lambda x: _clip(x, 0.0, 1.0),
+    "main_ret_5m": _tanh(3.0),
     # liquidity / cost
     "liquidity_usd": _log_center(4.3, 0.8),
     "liq_to_mcap": _tanh(8.0),
@@ -170,7 +180,14 @@ PRIOR_WEIGHTS: dict[str, float] = {
     "whale_net_flow": 1.50,
     "cluster_pct": -1.20,
     "twitter_mentions": 0.90,
+    "twitter_inst": 1.80,
+    "twitter_fresh": 1.20,
     "copy_signal": 1.00,
+    "dex_profile": 1.70,
+    "is_vamp": -2.20,
+    "is_beta": -0.70,
+    "is_main": 0.80,
+    "main_ret_5m": 0.90,
     "liquidity_usd": 0.40,
     "liq_to_mcap": 0.30,
     "price_impact": -0.90,
@@ -314,9 +331,48 @@ def evaluate_gates(
     min_tw = p("min_twitter_mentions", 0.0)
     if min_tw > 0 and "twitter_mentions" not in unknown and f.twitter_mentions < min_tw:
         vetoes.append(f"twitter: {f.twitter_mentions:.0f} mentions (want {min_tw:.0f})")
+    tw = getattr(enr, "twitter", None) or {}
+    if tw.get("official") and "official_age_min" in tw:
+        off_age = tw.get("official_age_min")
+        if off_age is None or off_age > 360:
+            age_s = "none" if off_age is None else f"{off_age:.0f}m"
+            vetoes.append(f"twitter: official quiet {age_s}")
+    copy_mcap = float(pb_section(strategy, chain).get("copy_max_mcap_usd", 2_000_000))
+    copy_min = float(pb_section(strategy, chain).get("copy_min_mcap_usd", 100_000))
+    ripped = enr.candidate.ret_5m > 0.20 or (
+        "parabolic" not in unknown and f.parabolic >= 0.60
+    )
+    if copy_min > 0 and enr.candidate.mcap_usd > 0 and enr.candidate.mcap_usd < copy_min:
+        vetoes.append(f"mcap: {enr.candidate.mcap_usd:.0f} below {copy_min:.0f} floor")
+    if copy_mcap > 0 and enr.candidate.mcap_usd > copy_mcap and ripped:
+        vetoes.append("priced: mcap already past copy window")
     max_cluster = p("max_cluster_pct", 0.0)
     if max_cluster > 0 and "cluster_pct" not in unknown and f.cluster_pct > max_cluster:
         vetoes.append(f"cluster: {f.cluster_pct:.0%} linked supply")
+    elif (
+        chain.value == "solana"
+        and enr.mint is not None
+        and ((max_cluster > 0 and "cluster_pct" in unknown) or "top1_pct" in unknown)
+        and not enr.candidate.dex_paid
+    ):
+        # Solana rugs look fine on mcap until the bubble is measured. Cheap
+        # prefilter has mint=None so it still passes; after we touched chain
+        # data, unmeasured cluster is a skip — not a visor souvenir.
+        vetoes.append("rug_filter: distribution unmeasured, skip")
+    if (
+        chain.value == "solana"
+        and bool(pb_section(strategy, chain).get("require_sponsor", False))
+        and "whale_n" in (getattr(enr, "crowd", None) or {})
+        and not _sponsored(enr)
+    ):
+        # Cheap prefilter has no whale_n, so it still spends RPC. After crowd
+        # is read, a Solana mint with no labeled KOL/whale is a skip — bundles
+        # on this chain hide inside fresh wallets.
+        vetoes.append("sponsor: no labeled KOL or whale")
+    if f.is_vamp >= 1:
+        vetoes.append("vamp: clone of an earlier ticker")
+    if f.is_beta >= 1 and f.main_ret_5m <= -0.20:
+        vetoes.append("beta: main runner is dumping")
 
     def check(name: str, requires: tuple[str, ...], failed: bool, message: str) -> None:
         missing = [r for r in requires if r in unknown]
@@ -338,11 +394,10 @@ def evaluate_gates(
         f.holder_count < p("min_holder_count", 60),
         f"{f.holder_count:.0f} holders",
     )
-    # Concentration is a score, not a veto - $TRUMP's top-10 was well above
-    # 55% and it was still a real market. The exception is one UNKNOWN wallet
-    # holding most of the supply: that is a rug, and known KOLs/whales are
-    # what distinguish the two. If the top holder is in our KOL/smart set,
-    # known_holder_pct covers them and this check stays quiet.
+    # Concentration is a score when known wallets sit in the top — $TRUMP's
+    # top-10 was well above 55% and it was still a real market. The exception
+    # is UNKNOWN wallets stacking circulating supply: that is a rug. LP and
+    # burn are already excluded from top1/top10 in distribution.analyze.
     unknown_whale = (
         f.top1_pct > p("max_unknown_top1_pct", 0.50)
         and f.known_holder_pct < f.top1_pct * 0.6
@@ -352,6 +407,16 @@ def evaluate_gates(
         ("top1_pct", "known_holder_pct"),
         unknown_whale,
         f"top holder {f.top1_pct:.0%} is not a known KOL/whale",
+    )
+    unknown_top10 = (
+        f.top10_pct > p("max_top10_pct", 0.50)
+        and f.known_holder_pct < f.top10_pct * 0.6
+    )
+    check(
+        "top10",
+        ("top10_pct", "known_holder_pct"),
+        unknown_top10,
+        f"top10 {f.top10_pct:.0%} not explained by known wallets",
     )
     check(
         "dev_holding",
@@ -416,7 +481,145 @@ def evaluate_gates(
             "unmeasured: " + ", ".join(abstained) + " (set gates.allow_unmeasured "
             "to trade blind on purpose)"
         )
+    # Cheap prefilter has mint=None; a full enrich has it. Don't grey-skip
+    # every Solana mint before holders are fetched.
+    if enr.mint is not None:
+        extra = bot_veto(
+            classify(f, unknown, age_minutes=enr.candidate.age_minutes),
+            chain.value,
+        )
+        if extra and not (
+            extra.startswith("unverified:") and enr.candidate.dex_paid
+        ):
+            vetoes.append(extra)
     return vetoes, abstained
+
+
+def _sponsored(enr: Enrichment) -> bool:
+    crowd = getattr(enr, "crowd", None) or {}
+    if crowd.get("kols") or int(crowd.get("whale_n") or 0) >= 1:
+        return True
+    f = enr.features
+    unknown = enr.unknown
+    if "copy_signal" not in unknown and f.copy_signal >= 1.0:
+        return True
+    if "whale_net_flow" not in unknown and f.whale_net_flow > 0:
+        return True
+    return False
+
+
+# Age/priced/retail fire because the clock moved, not because the thesis died.
+# Unmeasured/rug_filter would sell every Solana bag on a public-RPC 429.
+_HOLD_IGNORE = (
+    "age:",
+    "priced:",
+    "crowd_already_here",
+    "volume:",
+    "holders:",
+    "launchpad:",
+    "twitter:",
+    "rug_filter:",
+    "unverified:",
+    "unmeasured:",
+    "round_trip",
+    "sniper_bots",
+    "fresh_wallets",
+    "liquidity:",
+    "rubric:",
+    "sponsor:",
+)
+
+
+@dataclass(slots=True)
+class HoldReview:
+    """Stage 3 result. `cut` is set only when the open bag should go."""
+
+    cut: str | None
+    rubric: float
+    entry_rubric: float
+    strikes: int
+    why: str
+
+
+def _hold_lethal(vetoes: list[str]) -> str | None:
+    for v in vetoes:
+        if any(v.startswith(p) for p in _HOLD_IGNORE):
+            continue
+        return v
+    return None
+
+
+def _hold_sponsor(position: Position, enr: Enrichment) -> str | None:
+    if "top10_pct" in enr.unknown or "top1_pct" in enr.unknown:
+        return None
+    still = set((enr.crowd or {}).get("kols") or []) | set(
+        (enr.crowd or {}).get("wallets") or []
+    )
+    if position.entry_sponsors and still.isdisjoint(set(position.entry_sponsors)):
+        if enr.features.whale_net_flow <= 0 and enr.features.copy_signal < 1:
+            return "sponsor: labeled KOL/whale left"
+    return None
+
+
+def _hold_structure(position: Position, enr: Enrichment) -> str | None:
+    if position.ladder_filled:
+        return None
+    if "parabolic" in enr.unknown:
+        return None
+    if enr.features.parabolic >= 0.60:
+        return "chart: went parabolic after entry"
+    return None
+
+
+def _hold_rubric(position: Position, total: float, strategy: Config) -> str | None:
+    min_hold = float(strategy.get("hold.min_rubric", 5.5))
+    need = int(strategy.get("hold.strikes", 2))
+    if total < min_hold:
+        position.hold_strikes += 1
+        if position.hold_strikes >= need:
+            return f"rubric: hold {total:.1f} < {min_hold:.1f}"
+        return None
+    position.hold_strikes = 0
+    return None
+
+
+def hold_cut(
+    position: Position, enr: Enrichment, score: Score, strategy: Config
+) -> HoldReview:
+    """Stage 3: lethal → sponsor → structure → rubric. Same order as entry."""
+    total = float((score.rubric or {}).get("total") or 0.0)
+    entry = position.entry_rubric
+    grace_ms = int(float(strategy.get("hold.grace_seconds", 90)) * 1000)
+
+    def review(cut: str | None, why: str) -> HoldReview:
+        return HoldReview(
+            cut=cut,
+            rubric=total,
+            entry_rubric=entry,
+            strikes=position.hold_strikes,
+            why=why,
+        )
+
+    if now_ms() - position.opened_at_ms < grace_ms:
+        return review(None, "grace")
+
+    lethal = _hold_lethal(score.veto_reasons)
+    if lethal:
+        return review(lethal, lethal)
+    sponsor = _hold_sponsor(position, enr)
+    if sponsor:
+        return review(sponsor, sponsor)
+    structure = _hold_structure(position, enr)
+    if structure:
+        return review(structure, structure)
+    dropped = _hold_rubric(position, total, strategy)
+    line = f"{entry:.1f}→{total:.1f}"
+    if dropped:
+        return review(dropped, line)
+    need = int(strategy.get("hold.strikes", 2))
+    if position.hold_strikes:
+        line = f"{line} ({position.hold_strikes}/{need})"
+    return review(None, line)
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +718,10 @@ class Scorer:
 
     def score(self, enr: Enrichment) -> Score:
         vetoes, abstained = evaluate_gates(enr, self.strategy, self.store, live=self.live)
+        rubric = grade(enr, self.store, self.strategy)
+        min_r = float(self.strategy.get("scoring.min_rubric", 7.0))
+        if not vetoes and rubric.total < min_r:
+            vetoes.append(f"rubric: {rubric.total:.1f} < {min_r:.1f}")
         normalized = normalize(enr.features, enr.unknown)
         probability, contributions = self.model.probability(normalized)
         payoff = self.refresh_payoff()
@@ -526,6 +733,10 @@ class Scorer:
             expected_value=ev,
             contributions=contributions,
             veto_reasons=vetoes,
+            dist=classify(
+                enr.features, enr.unknown, age_minutes=enr.candidate.age_minutes
+            ).as_dict(),
+            rubric=rubric.as_visor(),
         )
         if abstained and not vetoes:
             score.contributions.setdefault("_abstained", 0.0)

@@ -100,6 +100,12 @@ class PositionManager:
                 )
             ]
 
+        tape = position.candidate.ret_5m
+        if gain > 0.08 and tape <= -0.12:
+            return [
+                ExitOrder(1.0, ExitReason.THESIS_CUT, "5m flipped, selling with tape")
+            ]
+
         ladder = self._ladder(position)
         # `fraction` in the ladder is of the ORIGINAL position, while an
         # ExitOrder is a fraction of what is LEFT. The conversion has to track

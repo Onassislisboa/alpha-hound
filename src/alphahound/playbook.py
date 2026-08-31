@@ -70,10 +70,13 @@ def copy_signal(
     """
     pb = section(strategy, chain)
     max_age = float(pb.get("copy_max_age_minutes", 25))
-    max_mcap = float(pb.get("copy_max_mcap_usd", 400_000))
+    max_mcap = float(pb.get("copy_max_mcap_usd", 2_000_000))
+    min_mcap = float(pb.get("copy_min_mcap_usd", 100_000))
     if age_minutes > max_age:
         return 0.0
     if mcap_usd > max_mcap > 0:
+        return 0.0
+    if min_mcap > 0 and mcap_usd < min_mcap:
         return 0.0
     buying = smart_buys >= 1 or (fomo_inside >= 1 and fomo_net_flow > 0) or whale_net_flow > 0.25
     return 1.0 if buying else 0.0

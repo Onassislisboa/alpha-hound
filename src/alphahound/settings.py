@@ -7,6 +7,7 @@ buy nothing but an install step.
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -278,6 +279,26 @@ def whale_addresses(rows: list[dict[str, Any]], *, source: str | None = None) ->
         if addr:
             out.add(addr)
     return out
+
+
+def load_kols(state_dir: Path) -> list[dict[str, Any]]:
+    path = state_dir / "kols.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    rows = data if isinstance(data, list) else []
+    return [dict(r) for r in rows if str(r.get("address") or "").strip()]
+
+
+def save_kols(state_dir: Path, rows: list[dict[str, Any]]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "kols.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def crowd_addresses(rows: list[dict[str, Any]], kind: str) -> set[str]:

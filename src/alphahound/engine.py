@@ -22,7 +22,7 @@ import json
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from . import learning
 from .discovery import Discovery
@@ -44,25 +44,36 @@ from .models import (
 )
 from .net import Http
 from .portfolio import ExitOrder, PositionManager
-from .playbook import max_age_minutes as pb_max_age
 from .preview import write_preview
-from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter
+from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
-from .scoring import Model, Scorer
+from .scoring import Model, Scorer, hold_cut
 from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
     Settings,
+    load_kols,
     load_strategy,
     load_terminals,
     load_whales,
 )
 from .signals import Enricher
+from .signals.pack import apply_tags, dump_beta_keys
 from .signals.solana import SolanaReader
 from .signals.terminals import TerminalRegistry
 from .store import Store, features_from_json, lock_state_dir
+from .verdict import security_cert
 
 log = get("engine")
+
+
+def _crowd_sponsors(crowd: dict | None) -> list[str]:
+    out: list[str] = []
+    for x in list((crowd or {}).get("kols") or []) + list((crowd or {}).get("wallets") or []):
+        s = str(x)
+        if s and s not in out:
+            out.append(s)
+    return out[:16]
 
 
 def build_registry(store: Store, terminals: Config) -> TerminalRegistry:
@@ -86,7 +97,8 @@ class Engine:
         self.http = Http()
         self.dex = Dexscreener(
             self.http,
-            cache_seconds=0.8 * float(self.strategy.get("loop.tick_seconds", 3.0)),
+            cache_seconds=0.5
+            * float(self.strategy.get("loop.quote_seconds", 1.0)),
         )
         self.helius = Helius(self.http, settings.helius_api_key)
         self.birdeye = Birdeye(self.http, settings.birdeye_api_key)
@@ -144,6 +156,10 @@ class Engine:
         self._tick_counts: Counter[str] = Counter()
         self._best_probability = 0.0
         self._last_heartbeat_ms = now_ms()
+        self._watch_in = 0
+        self._watch_out = 0
+        self._reads: dict[str, dict] = {}
+        self._inflight: set[str] = set()
         self._stop = asyncio.Event()
         self._load_positions()
 
@@ -178,7 +194,7 @@ class Engine:
 
         await self.discovery.start()
         try:
-            await asyncio.gather(self._risk_loop(), self._scan_loop())
+            await asyncio.gather(self._risk_loop(), self._scan_loop(), self._quote_loop())
         finally:
             await self.shutdown()
 
@@ -211,15 +227,46 @@ class Engine:
 
         await self._every(float(self.strategy.get("loop.tick_seconds", 3.0)), body, "risk pass")
 
+    async def _quote_loop(self) -> None:
+        async def body() -> None:
+            await self._refresh_watch_quotes()
+            self._write_preview()
+
+        await self._every(float(self.strategy.get("loop.quote_seconds", 1.0)), body, "quotes")
+
     async def _scan_loop(self) -> None:
         async def body() -> None:
+            self.enricher.whale_rows = load_whales() + load_kols(self.settings.state_dir)
+            self.enricher._smart_cache.clear()
+            self._drain_inspect()
             found = await self.discovery.poll()
+            before = set(self.watching)
             for candidate in found:
+                prev = self.watching.get(candidate.key)
+                if prev is not None:
+                    candidate.last_scored_ms = prev.last_scored_ms
+                if candidate.pack_role == "vamp":
+                    continue
+                if candidate.source != "inspect":
+                    cheap = self.enricher.free_enrichment(candidate)
+                    vetoes = [
+                        v
+                        for v in self.scorer.prefilter(cheap)
+                        if not v.startswith("age:") and not v.startswith("priced:")
+                    ]
+                    if vetoes:
+                        self._tick_counts[f"free_veto:{vetoes[0].split(':')[0]}"] += 1
+                        continue
                 self.watching[candidate.key] = candidate
+                self._reads.setdefault(candidate.key, {"call": "scan"})
             self.discovery.prune()
+            await self._refresh_watch_quotes()
             self._prune_watching()
+            self._watch_in = sum(1 for k in self.watching if k not in before)
+            self._watch_out = sum(1 for k in before if k not in self.watching)
             await self.score_and_enter()
             await self.maybe_learn()
+            self._write_preview()
 
         await self._every(float(self.strategy.get("loop.scan_seconds", 3.0)), body, "scan pass")
 
@@ -239,23 +286,35 @@ class Engine:
     # -- the loop ----------------------------------------------------------
 
     def _write_preview(self) -> None:
+        self._retag()
         halted, reason = self.risk.halted()
         holds = []
         for position in self.positions.values():
             mark = position.candidate.price_usd or position.entry_price
+            remaining = (
+                position.tokens_remaining / position.tokens if position.tokens else 0.0
+            )
+            held_usd = round(position.tokens_remaining * mark, 2)
             holds.append(
                 {
                     "key": position.candidate.key,
                     "symbol": position.candidate.symbol or "",
                     "chain": position.candidate.chain.value,
+                    "address": position.candidate.address,
                     "size_usd": round(position.size_usd, 2),
+                    "held_usd": held_usd,
+                    "unrealized_usd": round(position.unrealized_usd(mark), 2),
                     "unrealized_pct": round(position.gain(mark), 4),
-                    "remaining_pct": round(
-                        position.tokens_remaining / position.tokens if position.tokens else 0.0,
-                        4,
-                    ),
+                    "remaining_pct": round(remaining, 4),
                     "ladder": position.ladder_filled,
                     "age_min": int((now_ms() - position.opened_at_ms) / 60_000),
+                    "role": position.candidate.pack_role or "",
+                    "entry_rubric": round(position.entry_rubric, 1),
+                    "hold_rubric": round(position.last_hold_rubric, 1),
+                    "hold_why": position.last_hold_why,
+                    "hold_strikes": position.hold_strikes,
+                    "mcap": round(position.candidate.mcap_usd),
+                    "mcap_entry": round(position.entry_mcap_usd),
                 }
             )
         write_preview(
@@ -267,18 +326,39 @@ class Engine:
                 "halt_reason": reason,
                 "equity_usd": round(self.risk.equity(), 2),
                 "watching": len(self.watching),
+                "watch_in": self._watch_in,
+                "watch_out": self._watch_out,
                 "watch": [
                     {
                         "symbol": c.symbol or "",
+                        "name": c.name or "",
                         "chain": c.chain.value,
                         "address": c.address,
-                        "age_min": round(c.age_minutes, 1),
+                        "age_min": int(round(c.age_minutes)),
                         "mcap": round(c.mcap_usd),
                         "vol5m": round(c.volume_5m_usd),
+                        "ret_5m": round(c.ret_5m, 4),
                         "dex": c.dex_id,
                         "source": c.source,
+                        "role": c.pack_role or "solo",
+                        "stem": c.pack_stem,
+                        "pack": c.pack_size,
+                        "dex_paid": c.dex_paid,
+                        "dex_photo": c.dex_photo,
+                        "dex_aligned": c.dex_aligned,
+                        **(self._reads.get(c.key) or {"call": "scan"}),
                     }
-                    for c in sorted(self.watching.values(), key=lambda x: x.age_minutes)[:24]
+                    for c in sorted(
+                        self.watching.values(),
+                        key=lambda x: (
+                            {"scan": 0, "trade": 1, "wait": 2, "skip": 3}.get(
+                                (self._reads.get(x.key) or {}).get("call") or "scan", 4
+                            ),
+                            0 if x.dex_paid else 1,
+                            {"main": 0, "beta": 1, "solo": 2, "vamp": 3}.get(x.pack_role, 2),
+                            x.age_minutes,
+                        ),
+                    )
                 ],
                 "best_probability": round(self._best_probability, 3),
                 "tick": dict(self._tick_counts),
@@ -302,6 +382,8 @@ class Engine:
             "heartbeat",
             extra={
                 "watching": len(self.watching),
+                "watch_in": self._watch_in,
+                "watch_out": self._watch_out,
                 "open": len(self.positions),
                 "equity_usd": round(self.risk.equity(), 2),
                 "since_last": dict(self._tick_counts),
@@ -316,6 +398,7 @@ class Engine:
         if not self.positions:
             return
         halted, reason = self.risk.halted()
+        self._retag()
 
         for key, position in list(self.positions.items()):
             await self.enricher.refresh(position.candidate)
@@ -325,15 +408,58 @@ class Engine:
                 continue
 
             orders = self.exits.evaluate(position, price, position.candidate.liquidity_usd)
+            main = self.watching.get(position.candidate.main_key)
+            main_ret = main.ret_5m if main is not None else position.candidate.main_ret_5m
+            if position.candidate.pack_role == "beta" and main_ret <= -0.20:
+                orders = [
+                    ExitOrder(1.0, ExitReason.THESIS_CUT, "beta: main runner dumping")
+                ]
             if halted and not orders:
                 # The kill switch closes positions rather than merely stopping
                 # new ones. Halting entries while holding open risk is the
                 # worst of both states.
                 orders = [ExitOrder(1.0, ExitReason.KILL_SWITCH, reason)]
+            full = any(o.fraction >= 1.0 for o in orders)
+            if not full:
+                cut = await self._stage3(position)
+                if cut is not None:
+                    orders = [cut]
             for order in orders:
                 await self._exit(position, order.fraction, order.reason, order.note)
                 if position.tokens_remaining <= 1e-12:
                     break
+
+    async def _stage3(self, position: Position) -> ExitOrder | None:
+        now = now_ms()
+        grace = float(self.strategy.get("hold.grace_seconds", 90))
+        if now - position.opened_at_ms < int(grace * 1000):
+            return None
+        every = float(self.strategy.get("hold.rescore_seconds", 15))
+        if position.last_hold_ms and now - position.last_hold_ms < int(every * 1000):
+            return None
+        probe = max(10.0, float(self.strategy.get("risk.min_position_usd", 10)))
+        try:
+            enr = await self.enricher.enrich(position.candidate, probe)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("hold enrich failed", extra={"error": str(exc)})
+            return None
+        score = self.scorer.score(enr)
+        review = hold_cut(position, enr, score, self.strategy)
+        position.last_hold_ms = now
+        position.last_hold_rubric = review.rubric
+        position.last_hold_why = review.cut or review.why
+        prev = self._reads.get(position.candidate.key) or {}
+        self._reads[position.candidate.key] = {
+            **prev,
+            **(enr.crowd or {}),
+            "call": "hold",
+            "why": review.why,
+            "rubric": score.rubric or {},
+            "tw": enr.twitter or {},
+        }
+        if not review.cut:
+            return None
+        return ExitOrder(1.0, ExitReason.THESIS_CUT, review.cut)
 
     async def _exit(self, position: Position, fraction: float, reason: ExitReason, note: str) -> None:
         tokens = position.tokens_remaining * max(0.0, min(1.0, fraction))
@@ -394,6 +520,9 @@ class Engine:
             max_favorable_excursion=mfe,
             max_adverse_excursion=mae,
             entry_slippage=0.0,
+            symbol=position.candidate.symbol or "",
+            mcap_entry_usd=position.entry_mcap_usd or position.candidate.mcap_usd,
+            mcap_exit_usd=position.candidate.mcap_usd,
         )
         trade.error_class = learning.classify(trade, self.strategy)
         self.store.record_trade(trade)
@@ -415,8 +544,31 @@ class Engine:
                 "error_class": trade.error_class.value,
                 "exit_reason": reason.value,
                 "mfe": round(mfe, 3),
+                "mcap_entry": round(trade.mcap_entry_usd),
+                "mcap_exit": round(trade.mcap_exit_usd),
             },
         )
+        self._log_trade_file(trade)
+
+    def _log_trade_file(self, trade: TradeRecord) -> None:
+        # ponytail: one JSON line per close; sqlite is source of truth, this is grep.
+        path = self.settings.state_dir / "trades.jsonl"
+        rec = {
+            "ts": trade.closed_at_ms,
+            "symbol": trade.symbol or trade.key,
+            "chain": trade.chain.value,
+            "key": trade.key,
+            "size_usd": round(trade.size_usd, 2),
+            "pnl_usd": round(trade.pnl_usd, 2),
+            "pnl_pct": round(trade.pnl_pct, 4),
+            "mcap_entry": round(trade.mcap_entry_usd),
+            "mcap_exit": round(trade.mcap_exit_usd),
+            "exit": trade.exit_reason.value,
+            "venue": trade.venue.value,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
 
     # -- shadow tracking ---------------------------------------------------
     async def update_shadows(self) -> None:
@@ -453,6 +605,21 @@ class Engine:
                 for decision_id in by_address.get(snap.token_address, []):
                     self.store.update_shadow(decision_id, snap.price_usd)
 
+    def _drain_inspect(self) -> None:
+        path = self.settings.state_dir / "inspect.json"
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            data = []
+        path.unlink(missing_ok=True)
+        addrs = data if isinstance(data, list) else [data]
+        for raw in addrs:
+            addr = str(raw).strip()
+            if addr:
+                self.discovery.watch(addr)
+
     # -- scoring and entry -------------------------------------------------
     async def score_and_enter(self) -> None:
         if not self.watching:
@@ -462,14 +629,24 @@ class Engine:
             log.debug("not entering", extra={"reason": reason})
             return
 
-        limit = int(self.strategy.get("loop.max_candidates_per_tick", 40))
-        # Cheapest possible pre-rank: liquidity times recent volume, both free
-        # from the Dexscreener snapshot. Enrichment costs RPC calls, so it is
-        # spent on the top of this list rather than on everything.
-        ranked = sorted(
-            self.watching.values(),
-            key=lambda c: -(c.volume_5m_usd * min(c.liquidity_usd, 250_000.0)),
-        )[:limit]
+        limit = int(self.strategy.get("loop.max_candidates_per_tick", 8))
+        now = now_ms()
+
+        def _attention(c: Candidate) -> tuple:
+            if c.pack_role == "vamp":
+                return (3, 0.0, 0.0)
+            unseen = 0 if c.last_scored_ms == 0 else 1
+            stale = -(now - c.last_scored_ms)
+            vol = -c.volume_5m_usd
+            return (unseen, 0 if c.dex_paid else 1, stale, vol)
+
+        ranked = [
+            c
+            for c in sorted(self.watching.values(), key=_attention)
+            if c.key not in self.positions
+            and c.key not in self._inflight
+            and self.router.has_venue(c.chain)
+        ][:limit]
 
         probe_size = max(
             float(self.strategy.get("risk.min_position_usd", 15.0)),
@@ -483,19 +660,43 @@ class Engine:
         deadline = now_ms() + int(
             1000 * float(self.strategy.get("loop.entry_scan_budget_seconds", 20.0))
         )
+        n = max(1, int(self.strategy.get("loop.enrich_concurrency", 4)))
+        sem = asyncio.Semaphore(n)
 
-        for candidate in ranked:
-            if now_ms() > deadline:
-                self._tick_counts["scan_budget_spent"] += 1
-                break
-            if candidate.key in self.positions:
+        async def guarded(candidate: Candidate):
+            async with sem:
+                if now_ms() > deadline:
+                    self._tick_counts["scan_budget_spent"] += 1
+                    return None
+                return await self._score_one(candidate, probe_size)
+
+        scored = await asyncio.gather(*(guarded(c) for c in ranked), return_exceptions=True)
+        for item in scored:
+            if isinstance(item, Exception):
+                log.debug("score failed", extra={"error": str(item)})
                 continue
-            if not self.router.has_venue(candidate.chain):
+            if not item:
                 continue
+            decision, buyers, sponsors = item
+            decision_id = self.store.record_decision(decision)
+            await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
+
+    async def _score_one(
+        self, candidate: Candidate, probe_size: float
+    ) -> tuple[Decision, list[str], list[str]] | None:
+        self._inflight.add(candidate.key)
+        try:
+            if candidate.pack_role == "vamp":
+                self._drop_watch(candidate, "vamp")
+                return None
 
             cheap = self.enricher.free_enrichment(candidate)
-            free_vetoes = self.scorer.prefilter(cheap)
-            if free_vetoes:
+            free_vetoes = [
+                v
+                for v in self.scorer.prefilter(cheap)
+                if not v.startswith("age:") and not v.startswith("priced:")
+            ]
+            if free_vetoes and candidate.source != "inspect":
                 self._tick_counts[f"free_veto:{free_vetoes[0].split(':')[0]}"] += 1
                 self._record(
                     candidate,
@@ -506,19 +707,36 @@ class Engine:
                     free_vetoes[0],
                     cheap.unknown,
                 )
-                continue
+                self._drop_watch(candidate, "gate_skip")
+                return None
 
             try:
                 enrichment = await self.enricher.enrich(candidate, probe_size)
             except Exception as exc:  # noqa: BLE001
                 self._tick_counts["enrich_failed"] += 1
                 log.debug("enrich failed", extra={"key": candidate.key, "error": str(exc)})
-                continue
+                return None
 
             self._tick_counts["enriched"] += 1
             score = self.scorer.score(enrichment)
             self._best_probability = max(self._best_probability, score.probability)
             ok, why = self.scorer.passes(score)
+            call = "skip" if score.vetoed else ("trade" if ok else "wait")
+            mint = enrichment.mint
+            self._reads[candidate.key] = {
+                **(score.dist or {}),
+                **(enrichment.crowd or {}),
+                "call": call,
+                "holders": int(enrichment.features.holder_count or 0),
+                "why": why,
+                "cert": security_cert(
+                    (score.dist or {}).get("label") or "",
+                    score.veto_reasons,
+                    mint.authorities_revoked if mint is not None else None,
+                ),
+                "tw": enrichment.twitter or {},
+                "rubric": score.rubric or {},
+            }
             if not ok:
                 action = Action.REJECT_GATE if score.vetoed else Action.REJECT_SCORE
                 self._tick_counts[
@@ -527,7 +745,7 @@ class Engine:
                 self._record(
                     candidate, enrichment.features, score, action, 0.0, why, enrichment.unknown
                 )
-                continue
+                return None
 
             sizing = self.risk.size(candidate, score, self.scorer.payoff, list(self.positions.values()))
             if not sizing.allowed:
@@ -540,7 +758,7 @@ class Engine:
                     sizing.reason,
                     enrichment.unknown,
                 )
-                continue
+                return None
 
             decision = Decision(
                 candidate=candidate,
@@ -552,8 +770,10 @@ class Engine:
                 weights_version=self.scorer.model.version,
                 unknown=enrichment.unknown,
             )
-            decision_id = self.store.record_decision(decision)
-            await self._enter(decision, decision_id, buyers=enrichment.buyers)
+            return decision, enrichment.buyers, _crowd_sponsors(enrichment.crowd)
+        finally:
+            candidate.last_scored_ms = now_ms()
+            self._inflight.discard(candidate.key)
 
     def _record(
         self,
@@ -578,7 +798,13 @@ class Engine:
             )
         )
 
-    async def _enter(self, decision: Decision, decision_id: int, buyers: list[str] | None = None) -> None:
+    async def _enter(
+        self,
+        decision: Decision,
+        decision_id: int,
+        buyers: list[str] | None = None,
+        sponsors: list[str] | None = None,
+    ) -> None:
         candidate = decision.candidate
         signal_price = candidate.price_usd
         try:
@@ -628,6 +854,9 @@ class Engine:
             entry_unknown=sorted(decision.unknown),
             signal_price=signal_price,
             entry_buyers=list(buyers or []),
+            entry_sponsors=list(sponsors or []),
+            entry_rubric=float((decision.score.rubric or {}).get("total") or 0.0),
+            entry_mcap_usd=candidate.mcap_usd,
         )
         self.positions[candidate.key] = position
         self._save_positions()
@@ -645,6 +874,7 @@ class Engine:
                 "score": self.scorer.explain(decision.score),
                 "sizing": decision.reason,
                 "tx": fill.tx_id,
+                "mcap_usd": round(candidate.mcap_usd),
             },
         )
 
@@ -677,15 +907,139 @@ class Engine:
         )
 
     # -- housekeeping ------------------------------------------------------
+    async def _refresh_watch_quotes(self) -> None:
+        """Re-price everything on the visor. Discovery only re-emits a mint
+        about once a minute, so without this the mcap/vol/5m freeze at first sight.
+        """
+        addrs = list({c.address for c in self.watching.values() if c.address})
+        by: dict[str, Any] = {}
+        for i in range(0, len(addrs), 30):
+            try:
+                snaps = await self.dex.token_pairs(addrs[i : i + 30])
+            except Exception:  # noqa: BLE001
+                continue
+            by.update({s.token_address: s for s in snaps})
+        unpaid = []
+        for candidate in self.watching.values():
+            snap = by.get(candidate.address)
+            was_paid = candidate.dex_paid
+            if snap is not None:
+                candidate.price_usd = snap.price_usd or candidate.price_usd
+                candidate.mcap_usd = snap.mcap_usd or candidate.mcap_usd
+                candidate.volume_5m_usd = snap.volume_m5
+                candidate.liquidity_usd = snap.liquidity_usd
+                candidate.ret_5m = snap.price_change_m5
+                snap.stamp(candidate)
+                if snap.twitter:
+                    rec = self._reads.setdefault(candidate.key, {"call": "scan"})
+                    tw = dict(rec.get("tw") or {})
+                    if not twitter_handle(str(tw.get("official") or "")):
+                        tw["official"] = snap.twitter
+                        rec["tw"] = tw
+            if not candidate.dex_paid:
+                unpaid.append(candidate)
+            elif not was_paid:
+                candidate.last_scored_ms = 0
+                read = self._reads.get(candidate.key)
+                if read is not None:
+                    read["call"] = "scan"
+        for candidate in unpaid[:8]:
+            try:
+                paid = await self.dex.token_is_paid(candidate.chain, candidate.address)
+            except Exception:  # noqa: BLE001
+                continue
+            if not paid:
+                continue
+            candidate.dex_paid = True
+            candidate.last_scored_ms = 0
+            read = self._reads.get(candidate.key)
+            if read is not None:
+                read["call"] = "scan"
+
+    def _retag(self) -> dict:
+        by_key = {c.key: c for c in self.watching.values()}
+        extras = [
+            p.candidate for p in self.positions.values() if p.candidate.key not in by_key
+        ]
+        tags = apply_tags(list(by_key.values()) + extras)
+        for position in self.positions.values():
+            tag = tags.get(position.candidate.key)
+            if tag is None:
+                continue
+            position.candidate.pack_role = tag.role
+            position.candidate.pack_stem = tag.stem
+            position.candidate.main_key = tag.main_key
+            position.candidate.main_ret_5m = tag.main_ret_5m
+            position.candidate.pack_size = tag.pack_size
+        return tags
+
+    def _drop_watch(self, candidate: Candidate, tag: str) -> None:
+        if candidate.key in self.positions:
+            return
+        self.watching.pop(candidate.key, None)
+        self._reads.pop(candidate.key, None)
+        self.enricher.forget(candidate.key)
+        self._tick_counts[tag] += 1
+
     def _prune_watching(self) -> None:
+        tags = self._retag()
+        dying = dump_beta_keys(tags)
+        cap = int(self.strategy.get("loop.max_watching", 24))
+        ignore_mcap = float(self.strategy.get("whales.ignore_mcap_usd", 50_000_000))
+        now = now_ms()
         for key, candidate in list(self.watching.items()):
             if key in self.positions:
                 continue
-            if not candidate.created_at_ms or candidate.age_minutes > pb_max_age(
-                self.strategy, candidate.chain
+            if candidate.source == "inspect":
+                if candidate.last_scored_ms and now - candidate.last_scored_ms > 180_000:
+                    del self.watching[key]
+                    self.enricher.forget(key)
+                continue
+            if ignore_mcap > 0 and candidate.mcap_usd > ignore_mcap:
+                del self.watching[key]
+                self.enricher.forget(key)
+                continue
+            if candidate.pack_role == "vamp":
+                del self.watching[key]
+                self.enricher.forget(key)
+                self._tick_counts["vamp"] += 1
+                continue
+            if key in dying:
+                del self.watching[key]
+                self.enricher.forget(key)
+                self._tick_counts["beta_dump"] += 1
+                continue
+            # Solo already looked at: 4 min on the visor, then rotate.
+            if (
+                candidate.pack_role in ("", "solo")
+                and candidate.last_scored_ms
+                and now - candidate.last_scored_ms > 240_000
             ):
                 del self.watching[key]
                 self.enricher.forget(key)
+                continue
+            visor_age = float(self.strategy.get("loop.max_candidate_age_minutes", 180))
+            if not candidate.created_at_ms or candidate.age_minutes > visor_age:
+                del self.watching[key]
+                self.enricher.forget(key)
+
+        overflow = [c for c in self.watching.values() if c.key not in self.positions]
+        if len(self.watching) > cap:
+            overflow.sort(
+                key=lambda c: (
+                    0 if c.source == "inspect" else 1,
+                    0 if c.dex_paid else 1,
+                    0 if c.pack_role == "main" else 1 if c.pack_role == "beta" else 2,
+                    3 if (self._reads.get(c.key) or {}).get("call") == "skip" else 0,
+                    c.age_minutes,
+                    -c.volume_5m_usd,
+                )
+            )
+            slots = max(0, cap - len(self.positions))
+            for key in {c.key for c in overflow[slots:]}:
+                del self.watching[key]
+                self.enricher.forget(key)
+        self._reads = {k: v for k, v in self._reads.items() if k in self.watching}
 
     def _save_positions(self) -> None:
         payload = []

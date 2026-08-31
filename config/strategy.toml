@@ -9,19 +9,27 @@
 # How often open positions are re-priced and exits evaluated. This loop runs
 # independently of the entry scan so a slow RPC cannot delay a stop.
 tick_seconds = 3.0
+# Visor mcap/price. Own loop so a slow Stage-3 enrich cannot freeze the cards.
+quote_seconds = 0.5
 # How often discovery runs and new candidates are scored.
-scan_seconds = 3.0
+scan_seconds = 2.0
 # A candidate older than this is no longer an early signal, it is a chart.
 max_candidate_age_minutes = 180
 # Hard cap on candidates fully enriched per tick, to bound RPC spend. Only
 # candidates that survive the free gates get here, so this is the real budget.
-max_candidates_per_tick = 40
+# Keep this below max_watching so attention rotates instead of re-scoring the
+# same 40 every pass.
+max_candidates_per_tick = 12
+# How many enrichments run at once. Sequential was one SCAN pill on the visor.
+enrich_concurrency = 4
+# Discovery dumps hundreds of pairs. Cap the visor and skip the rest; vamps
+# drop first, mains stay. Unseen names rotate in next scan.
+max_watching = 40
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
 heartbeat_seconds = 60.0
 # Wall-clock budget for one entry-scan pass, after which the candidate list is
-# re-ranked. Must be long enough to enrich at least one candidate on your RPC:
-# a public endpoint needs tens of seconds, a paid one a couple.
-entry_scan_budget_seconds = 20.0
+# re-ranked. Solana dies while you wait; keep this tight.
+entry_scan_budget_seconds = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +65,9 @@ max_bundle_pct = 0.25
 # KOL/whale holding the same share (the $TRUMP *shape* on a fresh launch) is
 # not vetoed — it still scores as concentrated, so size stays small.
 max_unknown_top1_pct = 0.50
+# Circulating top-10 (LP and burn already excluded) above this, unless known
+# wallets explain most of that share, is a dump waiting to happen.
+max_top10_pct = 0.50
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +139,7 @@ attribution_window_minutes = 10
 # that survive the free gates is the per-tick RPC bill. 250 x 40 candidates is
 # 10k calls per tick, which no RPC serves in three seconds and none serve
 # cheaply - hence a number that a paid endpoint can actually keep up with.
-max_txs_inspected = 60
+max_txs_inspected = 24
 
 
 [flow]
@@ -154,6 +165,8 @@ size_pct = 0.02
 # Cope Capital elite filter when COPE_API_KEY is set.
 min_win_rate = 0.55
 min_trades = 8
+# Whale buying a >$50M token is accumulating, not a launch. Ignore the wallet.
+ignore_mcap_usd = 50000000
 
 
 # ---------------------------------------------------------------------------
@@ -162,11 +175,14 @@ min_trades = 8
 # ---------------------------------------------------------------------------
 [scoring]
 # Minimum modeled win probability to consider a trade.
-min_probability = 0.58
+min_probability = 0.54
 # Minimum expected value, as a fraction of position size, AFTER subtracting
 # every cost we can predict. A positive score with negative EV is a losing
 # trade with good self-esteem.
-min_expected_value = 0.04
+min_expected_value = 0.03
+# Stage-2 0–10 composite. Weights: dist 20, crowd 25, flow 20, chart 25, narrative 10.
+# Below this the token is not a buy candidate even if EV looks fine.
+min_rubric = 6.0
 # Until this many closed trades exist, the model has no opinion worth acting
 # on and every feature contributes at its prior weight.
 min_trades_for_learned_weights = 40
@@ -220,7 +236,7 @@ max_exposure_per_deployer_pct = 0.06
 [exits]
 # Scale out, keep a runner. Buy early, hold, sell slices on the way up —
 # not a market-dump of the whole bag at the first green candle.
-take_profit_ladder = [[1.40, 0.20], [2.20, 0.20], [3.50, 0.20]]
+take_profit_ladder = [[1.50, 0.20], [2.20, 0.20], [3.50, 0.20]]
 # Trailing stop, activated only after the first ladder rung fills. [auto]
 trailing_stop_pct = 0.18
 # Hard stop from entry. [auto]
@@ -236,6 +252,17 @@ liquidity_drawdown_exit = 0.35
 # Spike died before the first take: dump this far off peak and the thesis
 # is gone. Narrower than 45% so it fires while the hard stop still would not.
 thesis_cut_from_peak = 0.28
+
+
+# ---------------------------------------------------------------------------
+# Stage 3. Same pipeline as entry, on the open bag. Price exits (stop / TP /
+# drain) still win if they fire first.
+# ---------------------------------------------------------------------------
+[hold]
+grace_seconds = 90
+min_rubric = 5.5
+strikes = 2
+rescore_seconds = 15
 
 
 # ---------------------------------------------------------------------------
@@ -299,22 +326,31 @@ shadow_track_minutes = 60
 # Leave ENABLED_CHAINS=solana until you actually want RH fills.
 # ---------------------------------------------------------------------------
 [playbooks.solana]
-copy_max_age_minutes = 25
-copy_max_mcap_usd = 400000
-max_cluster_pct = 0.45
+# Coins die in minutes and vamps are everywhere. Short window, tight cluster.
+max_age_minutes = 45
+copy_max_age_minutes = 30
+copy_min_mcap_usd = 100000
+copy_max_mcap_usd = 2000000
+max_cluster_pct = 0.28
+max_unknown_top1_pct = 0.28
+max_bundle_pct = 0.18
+# KOL/whale is a boost, not a gate, until the lists are filled.
+require_sponsor = false
 
 [playbooks.bnb]
 copy_max_age_minutes = 25
-copy_max_mcap_usd = 400000
+copy_min_mcap_usd = 100000
+copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.45
 
 [playbooks.robinhood_chain]
-max_age_minutes = 50
-copy_max_age_minutes = 20
-copy_max_mcap_usd = 300000
+# Hot venue: more aggressive window, but first take above fee drag.
+max_age_minutes = 55
+copy_max_age_minutes = 25
+copy_min_mcap_usd = 100000
+copy_max_mcap_usd = 2000000
 max_cluster_pct = 0.40
-min_volume_5m = 8000
-min_twitter_mentions = 3
+min_volume_5m = 5000
+min_twitter_mentions = 2
 thesis_cut_from_peak = 0.22
-# Bank initials faster; this chain is moving.
-take_profit_ladder = [[1.20, 0.35], [1.80, 0.20], [3.00, 0.15]]
+take_profit_ladder = [[1.50, 0.30], [2.20, 0.20], [4.00, 0.15]]
