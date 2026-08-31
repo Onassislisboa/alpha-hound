@@ -8,13 +8,14 @@ stays current without another data API.
 from __future__ import annotations
 
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from .models import Chain, now_ms
 from .playbook import max_age_minutes
-from .settings import Config, Settings
+from .settings import Config, Settings, load_kols, save_kols
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
@@ -22,9 +23,15 @@ PREVIEW_NAME = "preview.json"
 
 def write_preview(state_dir: Path, payload: dict[str, Any]) -> None:
     path = state_dir / PREVIEW_NAME
+    blob = json.dumps(payload, separators=(",", ":"))
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    tmp.write_text(blob, encoding="utf-8")
+    try:
+        tmp.replace(path)
+    except PermissionError:
+        # ponytail: Windows holds preview.json while the HTTP handler reads it.
+        path.write_text(blob, encoding="utf-8")
+        tmp.unlink(missing_ok=True)
 
 
 def read_preview(state_dir: Path) -> dict[str, Any]:
@@ -62,6 +69,70 @@ def universe(settings: Settings | None, strategy: Config | None) -> dict[str, An
     return {"mode": settings.mode, "chains": rows}
 
 
+def pnl_curves(trades: list) -> dict[str, Any]:
+    chains = ("solana", "bnb", "robinhood_chain")
+    acc = {c: 0.0 for c in chains}
+    total = 0.0
+    series: dict[str, list] = {c: [] for c in chains}
+    series["total"] = []
+    for t in trades:
+        c = t.chain.value
+        acc[c] = acc.get(c, 0.0) + t.pnl_usd
+        total += t.pnl_usd
+        series["total"].append({"t": t.closed_at_ms, "y": round(total, 2)})
+        if c in series:
+            series[c].append({"t": t.closed_at_ms, "y": round(acc[c], 2)})
+    return {
+        "total": round(total, 2),
+        "by_chain": {c: round(acc[c], 2) for c in chains},
+        "series": series,
+    }
+
+
+_BOOK: tuple[float, dict[str, Any]] | None = None
+
+
+def _closed_book(store: Store) -> dict[str, Any]:
+    """Sqlite barely changes between visor polls. Reuse for ~800ms."""
+    global _BOOK
+    now = time.monotonic()
+    if _BOOK is not None and now - _BOOK[0] < 0.8:
+        return _BOOK[1]
+    sample = store.trades(limit=500)
+    recent = sample[-40:]
+    hold_ms = [t.closed_at_ms - t.opened_at_ms for t in sample if t.closed_at_ms > t.opened_at_ms]
+    book = {
+        "sold": [
+            {
+                "key": t.key,
+                "chain": t.chain.value,
+                "venue": t.venue.value,
+                "size_usd": round(t.size_usd, 2),
+                "pnl_usd": round(t.pnl_usd, 2),
+                "pnl_pct": round(t.pnl_pct, 4),
+                "exit": t.exit_reason.value,
+                "klass": t.error_class.value,
+                "mfe": round(t.max_favorable_excursion, 4),
+                "hold_min": int(round((t.closed_at_ms - t.opened_at_ms) / 60_000)),
+                "closed_at_ms": t.closed_at_ms,
+                "symbol": t.symbol or "",
+                "mcap_entry": round(t.mcap_entry_usd),
+                "mcap_exit": round(t.mcap_exit_usd),
+            }
+            for t in reversed(recent)
+        ],
+        "wins": sum(1 for t in sample if t.won),
+        "fees": sum(t.fees_usd for t in sample),
+        "avg_hold_min": int(round((sum(hold_ms) / len(hold_ms)) / 60_000)) if hold_ms else None,
+        "realized": round(store.realized_pnl(), 2),
+        "closed_n": store.trade_count(),
+        "pnl_chart": pnl_curves(sample),
+        "sample_n": len(sample),
+    }
+    _BOOK = (now, book)
+    return book
+
+
 def assemble(
     state_dir: Path,
     store: Store,
@@ -70,28 +141,21 @@ def assemble(
     strategy: Config | None = None,
 ) -> dict[str, Any]:
     live = read_preview(state_dir)
-    trades = store.trades(limit=40)
-    wins = sum(1 for t in trades if t.won)
-    fees = sum(t.fees_usd for t in trades)
-    sold = [
-        {
-            "key": t.key,
-            "chain": t.chain.value,
-            "venue": t.venue.value,
-            "size_usd": round(t.size_usd, 2),
-            "pnl_usd": round(t.pnl_usd, 2),
-            "pnl_pct": round(t.pnl_pct, 4),
-            "exit": t.exit_reason.value,
-            "klass": t.error_class.value,
-            "mfe": round(t.max_favorable_excursion, 4),
-            "closed_at_ms": t.closed_at_ms,
-        }
-        for t in trades
-    ]
+    book = _closed_book(store)
+    sold = book["sold"]
+    wins = book["wins"]
+    fees = book["fees"]
+    avg_hold_min = book["avg_hold_min"]
     stale_s = 0.0
     if live.get("ts_ms"):
         stale_s = max(0.0, (now_ms() - int(live["ts_ms"])) / 1000.0)
     watch = live.get("watch") or []
+    holds = live.get("holds") or []
+    unreal = sum(float(h.get("unrealized_usd") or 0) for h in holds)
+    realized = book["realized"]
+    closed_n = book["closed_n"]
+    start_eq = float(strategy.get("risk.equity_usd", equity)) if strategy else equity
+    pnl = round(realized + unreal, 2)
     return {
         "ts_ms": now_ms(),
         "bot_ts_ms": live.get("ts_ms"),
@@ -101,17 +165,28 @@ def assemble(
         "halted": live.get("halted", False),
         "halt_reason": live.get("halt_reason", ""),
         "equity_usd": round(float(live.get("equity_usd", equity)), 2),
-        "realized_pnl": round(store.realized_pnl(), 2),
+        "realized_pnl": realized,
+        "unrealized_pnl": round(unreal, 2),
+        "pnl": pnl,
+        "start_equity": round(start_eq, 2),
         "fees_usd": round(fees, 2),
-        "closed": len(trades) if trades else store.trade_count(),
+        "closed": closed_n,
         "wins": wins,
+        "win_rate": round(wins / book["sample_n"], 4) if book["sample_n"] else None,
+        "avg_hold_min": avg_hold_min,
+        "holding": len(holds),
+        "holding_usd": round(sum(float(h.get("held_usd") or h.get("size_usd") or 0) for h in holds), 2),
         "watching": live.get("watching", len(watch)),
+        "watch_in": int(live.get("watch_in") or 0),
+        "watch_out": int(live.get("watch_out") or 0),
         "best_probability": live.get("best_probability", 0.0),
         "tick": live.get("tick") or {},
-        "holds": live.get("holds") or [],
+        "holds": holds,
         "watch": watch,
         "sold": sold,
         "universe": universe(settings, strategy),
+        "kols": load_kols(state_dir),
+        "pnl_chart": book["pnl_chart"],
     }
 
 
@@ -120,35 +195,106 @@ HTML = """<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>alpha-hound</title>
+<title>FIRSTKILL</title>
 <style>
-  :root { color-scheme: dark; --line:#1c222b; --muted:#6b7785; --text:#d7dde5; --hi:#f2f5f8; }
+  :root { color-scheme: dark; --line:#161616; --muted:#6a6a6a; --text:#c8c8c8; --hi:#f5f5f5; }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
-         background: #0b0d10; color: var(--text); }
-  header { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end;
-           padding: 18px 22px; border-bottom: 1px solid var(--line); }
-  h1 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+  body { margin: 0; font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+         background: #000; color: var(--text); }
+  header { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-end;
+           padding: 16px 20px 12px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 10px; letter-spacing: .16em; text-transform: uppercase;
        color: var(--muted); font-weight: 600; margin: 0 0 4px; }
-  .n { font-size: 22px; color: var(--hi); }
-  .up { color: #3ddc97; } .dn { color: #ff6b6b; } .muted { color: var(--muted); }
-  .pill { font-size: 11px; padding: 2px 8px; border: 1px solid #2a3340; border-radius: 99px; }
-  .on { border-color: #3ddc97; color: #3ddc97; }
-  .off { opacity: .45; }
-  main { display: grid; grid-template-columns: 1.1fr 1fr; }
-  section { padding: 16px 22px; }
+  .brand { line-height: .95; }
+  .brand .first { font-size: 28px; font-weight: 800; letter-spacing: .18em; color: #fff; }
+  .brand .kill { font-size: 28px; font-weight: 800; letter-spacing: .18em; color: #ff3b4e;
+                 text-shadow: 0 0 22px #ff3b4e88; }
+  .n { font-size: 22px; color: var(--hi); font-variant-numeric: tabular-nums; }
+  .up { color: #3dff9a; } .dn { color: #ff3b4e; } .muted { color: var(--muted); }
+  .gold { color: #ffd24a; } .cyan { color: #3ad6ff; } .vol { color: #b07dff; }
+  .pill { font-size: 10px; padding: 1px 7px; border: 1px solid #2a2a2a; border-radius: 99px; }
+  .on { border-color: #3dff9a; color: #3dff9a; }
+  .off { opacity: .4; }
+  .r-main { border-color: #ffd24a; color: #ffd24a; }
+  .r-beta { border-color: #3ad6ff; color: #3ad6ff; }
+  .r-vamp { border-color: #ff3b4e; color: #ff3b4e; }
+  .verdict { margin: 0 20px; padding: 10px 14px; border: 1px solid var(--line);
+             border-radius: 8px; display: flex; gap: 14px; align-items: baseline; }
+  .verdict .tag { font-size: 13px; font-weight: 800; letter-spacing: .14em; }
+  .verdict.wait .tag { color: #ffd24a; }
+  .verdict.up { border-color: #133; background: #03140c; }
+  .verdict.dn { border-color: #311; background: #140306; }
+  .verdict.wait { border-color: #332; background: #100e04; }
+  .tabs { display: flex; gap: 4px; padding: 8px 20px 0; border-bottom: 1px solid var(--line); }
+  .tabs button { font: inherit; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+                 color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent;
+                 padding: 8px 12px; cursor: pointer; }
+  .tabs button.on { color: #fff; border-bottom-color: #ff3b4e; }
+  .panel { display: none; }
+  .panel.on { display: block; }
+  .kol-form { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 20px; }
+  .kol-form input, .kol-form select { font: inherit; background: #111; color: var(--hi);
+                 border: 1px solid #2a2a2a; padding: 6px 8px; border-radius: 4px; }
+  .kol-form button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
+                     padding: 6px 12px; cursor: pointer; }
+  #pnl-chart { width: 100%; height: 240px; display: block; }
+  .pnl-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+               gap: 10px; padding: 14px 20px; }
+  .v-bundled { color: #ff3b4e; } .v-cabaled { color: #ffb020; }
+  .v-organic { color: #5b8cff; } .v-unverified { color: #6a6a6a; }
+  tr.pick { cursor: pointer; }
+  tr.pick.on td { background: #0c0c0c; }
+  .coin-panel { margin: 0 20px 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; }
+  .coin-h { display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; }
+  .coin-h .fit { font-size: 28px; font-weight: 800; color: #fff; }
+  .coin-h .mcap { font-size: 22px; font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; }
+  .coin-h .age { font-size: 15px; font-weight: 700; color: #ffd24a; }
+  .coin-panel ul { margin: 8px 0 0; padding-left: 16px; color: var(--text); }
+  button.copy { font: inherit; font-size: 10px; background: #111; color: #c8c8c8; border: 1px solid #333;
+                padding: 2px 8px; border-radius: 4px; cursor: pointer; letter-spacing: .04em; }
+  button.copy:hover { color: #fff; border-color: #555; }
+  .watch-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .watch-bar h1 { margin: 0; }
+  .watch-bar input { font: inherit; background: #0a0a0a; color: #fff; border: 1px solid #333;
+                     padding: 6px 10px; border-radius: 6px; min-width: 220px; flex: 1; }
+  .watch-bar button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
+                      padding: 6px 12px; cursor: pointer; border-radius: 6px; }
+  .watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+  .wcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #050505; cursor: pointer; }
+  .wcard.on { border-color: #555; background: #0c0c0c; }
+  .wcard-h { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .wcard .mcap { font-size: 22px; font-weight: 800; color: #fff; letter-spacing: -.03em; line-height: 1.1;
+                 font-variant-numeric: tabular-nums; }
+  .wcard .age { font-size: 15px; font-weight: 700; color: #ffd24a; font-variant-numeric: tabular-nums; }
+  .wcard .meta { font-size: 11px; color: var(--muted); margin: 2px 0; }
+  .wcard .kols { font-size: 11px; color: #c8c8c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dex-paid { color: #3dff9a; font-weight: 800; letter-spacing: .08em; }
+  .dex-no { color: #ff3b4e; font-weight: 800; letter-spacing: .08em; }
+  .cert-ok { color: #3dff9a; font-weight: 700; letter-spacing: .06em; }
+  .cert-no { color: #ff3b4e; font-weight: 700; letter-spacing: .06em; }
+  .cert-q { color: #6a6a6a; font-weight: 700; letter-spacing: .06em; }
+  .st-scan { color: #5b8cff; } .st-skip { color: #ff3b4e; }
+  .st-wait { color: #ffb020; } .st-trade { color: #3dff9a; }
+  table.book td { font-variant-numeric: tabular-nums; }
+  table.book .sym { font-size: 15px; font-weight: 700; }
+  table.book .pnl { font-size: 16px; font-weight: 800; }
+  table.book .mcap-path { font-size: 13px; color: #fff; font-weight: 600; }
+  table.book th { position: sticky; top: 0; background: #000; z-index: 1; }
+  main { display: grid; grid-template-columns: 1fr 1fr; }
+  main > section:first-child { grid-column: 1 / -1; }
+  section { padding: 14px 20px; }
   section + section { border-left: 1px solid var(--line); }
   .full { grid-column: 1 / -1; border-top: 1px solid var(--line); border-left: 0 !important; }
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 10px;
        letter-spacing: .08em; text-transform: uppercase; padding: 6px 10px 8px 0; }
-  td { padding: 7px 10px 7px 0; border-top: 1px solid #161b22; vertical-align: top; }
+  td { padding: 6px 10px 6px 0; border-top: 1px solid #111; vertical-align: top; }
   .sym { color: var(--hi); }
-  .ca { color: var(--muted); font-size: 12px; }
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-  .card h2 { margin: 0 0 8px; font-size: 13px; color: var(--hi); font-weight: 600; }
-  .card p { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+  .ca { color: var(--muted); font-size: 11px; display: flex; gap: 6px; align-items: center; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #050505; }
+  .card h2 { margin: 0 0 6px; font-size: 13px; color: var(--hi); font-weight: 600; }
+  .card p { margin: 0 0 5px; font-size: 12px; color: var(--muted); }
   .addr { font-size: 11px; color: var(--text); word-break: break-all; }
   @media (max-width: 900px) {
     main, .grid { grid-template-columns: 1fr; }
@@ -158,94 +304,460 @@ HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <div><h1>alpha-hound</h1><div id="status" class="muted">loading</div></div>
+  <div class="brand">
+    <div><span class="first">FIRST</span><span class="kill">KILL</span></div>
+    <div id="status" class="muted">loading</div>
+  </div>
   <div><h1>equity</h1><div class="n" id="equity">—</div></div>
-  <div><h1>realized</h1><div class="n" id="pnl">—</div></div>
-  <div><h1>fees</h1><div class="n" id="fees">—</div></div>
-  <div><h1>closed</h1><div class="n" id="closed">—</div></div>
-  <div><h1>watching</h1><div class="n" id="watching">—</div></div>
+  <div><h1>pnl</h1><div class="n" id="pnl">—</div></div>
+  <div><h1>win rate</h1><div class="n" id="winrate">—</div></div>
+  <div><h1>avg hold</h1><div class="n" id="avghold">—</div></div>
+  <div><h1>holding</h1><div class="n gold" id="holding">—</div></div>
+  <div><h1>watching</h1><div class="n cyan" id="watching">—</div></div>
 </header>
-<section class="full" style="padding:16px 22px 8px">
-  <h1>what it trades</h1>
+<div id="verdict" class="verdict wait"><span class="tag">WAITING</span><span class="muted" id="verdict-h">sem trades ainda</span></div>
+<nav class="tabs">
+  <button type="button" class="on" data-tab="tab-watch">watch</button>
+  <button type="button" data-tab="tab-kols">kols</button>
+  <button type="button" data-tab="tab-pnl">pnl</button>
+</nav>
+<div id="tab-watch" class="panel on">
+<section class="full" style="padding:14px 20px 6px">
+  <h1>chains</h1>
   <div class="grid" id="universe"></div>
 </section>
 <main>
   <section>
-    <h1>in view</h1>
-    <table id="watch"><thead><tr>
-      <th>token</th><th>chain</th><th>age</th><th>mcap</th><th>vol 5m</th>
-    </tr></thead><tbody></tbody></table>
+    <div class="watch-bar">
+      <h1>watching</h1>
+      <input id="ca-in" placeholder="colar CA" autocomplete="off" spellcheck="false"/>
+      <button type="button" id="paste-ca">colar</button>
+    </div>
+    <div id="watch" class="watch-grid"></div>
+    <div id="coin" class="coin-panel" hidden></div>
   </section>
   <section>
     <h1>holds</h1>
-    <table id="holds"><thead><tr>
-      <th>token</th><th>size</th><th>pnl</th><th>left</th><th>age</th>
+    <table id="holds" class="book"><thead><tr>
+      <th>token</th><th>held</th><th>pnl</th><th>left</th><th>age</th><th>mcap</th><th>stage 3</th>
     </tr></thead><tbody></tbody></table>
     <h1 style="margin-top:22px">sold</h1>
-    <table id="sold"><thead><tr>
-      <th>token</th><th>size</th><th>pnl</th><th>exit</th>
+    <table id="sold" class="book"><thead><tr>
+      <th>token</th><th>size</th><th>pnl</th><th>mcap</th><th>hold</th><th>exit</th>
     </tr></thead><tbody></tbody></table>
   </section>
 </main>
+</div>
+<div id="tab-kols" class="panel">
+  <p class="muted" style="padding:14px 20px 0">Seguir não é copiar. Cada mint ainda passa nos gates. Só wallets aqui entram no sinal de copy, e só se o token for young/small.</p>
+  <form class="kol-form" id="kol-form">
+    <input name="address" placeholder="wallet / CA" required size="42"/>
+    <input name="handle" placeholder="@handle" size="16"/>
+    <select name="klass"><option value="kol">kol</option><option value="whale">whale</option></select>
+    <button type="submit">add</button>
+  </form>
+  <section>
+    <table id="kols"><thead><tr>
+      <th>handle</th><th>class</th><th>chain</th><th>address</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+</div>
+<div id="tab-pnl" class="panel">
+  <div class="pnl-cards" id="pnl-cards"></div>
+  <section>
+    <h1>equity curve</h1>
+    <svg id="pnl-chart" viewBox="0 0 800 240" preserveAspectRatio="none"></svg>
+  </section>
+</div>
 <script>
 const $ = id => document.getElementById(id);
 const usd = n => (n<0?'−':'') + '$' + Math.abs(n).toFixed(2);
-const compact = n => n>=1e6 ? '$'+(n/1e6).toFixed(1)+'m' : n>=1e3 ? '$'+(n/1e3).toFixed(1)+'k' : usd(n||0);
-const pct = n => (n>=0?'+':'') + (n*100).toFixed(1) + '%';
+const kM = n => {
+  n = Math.abs(Number(n)||0);
+  if (n >= 1e6) return (Math.round(n/1e5)/10) + 'M';
+  if (n >= 1e4) return Math.round(n/1000) + 'k';
+  if (n >= 1e3) return (Math.round(n/100)/10) + 'k';
+  return String(Math.round(n));
+};
+const pct = n => (n>=0?'+':'') + Math.round(n*100) + '%';
 const cls = n => n>0?'up':n<0?'dn':'';
-const short = k => (k.split(':')[1] || k).slice(0, 8);
+const chainShort = c => ({solana:'SOL', bnb:'BNB', robinhood_chain:'HOOD'}[c] || (c||'').toUpperCase());
+const ageTxt = m => {
+  m = Number(m)||0;
+  if (m >= 60) {
+    const h = m/60;
+    return (h >= 10 ? Math.round(h) : Math.round(h*10)/10) + 'h';
+  }
+  return Math.round(m) + ' min';
+};
+const certHtml = c => c==='ok' ? '<span class="cert-ok">CERT OK</span>'
+  : c==='no' ? '<span class="cert-no">CERT NO</span>'
+  : '<span class="cert-q">CERT —</span>';
+function twLine(tw) {
+  if (!tw || !(tw.official || (tw.posts||[]).length || tw.utility)) return '';
+  const age = tw.official_age_min == null ? '' : ' '+ageTxt(tw.official_age_min);
+  const inst = tw.inst ? ' · inst' : '';
+  const quiet = tw.official_age_min != null && tw.official_age_min > 360 ? ' quiet' : '';
+  return '<div class="meta">tw '+(tw.official?('@'+tw.official):'')+age+inst+quiet
+    +(tw.utility?' · '+tw.utility:'')+'</div>';
+}
+function twBlock(tw) {
+  if (!tw) return '';
+  const posts = (tw.posts||[]).map(p => '<li>@'+p.handle+' · '+kM(p.followers)+' · '
+    +(p.age_min==null?'':ageTxt(p.age_min)+' · ')+(p.text||'')+'</li>').join('');
+  return twLine(tw) + (posts ? '<ul>'+posts+'</ul>' : '');
+}
+function dexLine(w) {
+  const paid = w.dex_paid
+    ? '<span class="dex-paid">DEX PAID</span>'
+    : '<span class="dex-no">NOT DEX</span>';
+  const extra = [];
+  if (w.dex_photo) extra.push('foto');
+  if (w.dex_aligned) extra.push('alinhada');
+  return '<div class="meta">'+paid+(extra.length ? ' · '+extra.join(' · ') : '')+'</div>';
+}
+function rubricLine(r) {
+  if (!r || r.total == null) return '';
+  return '<div class="meta">score '+r.total
+    +' · d'+r.dist+' c'+r.crowd+' f'+r.flow+' g'+r.chart+' n'+r.narrative+'</div>';
+}
+const mins = n => ageTxt(n);
+const caHead = a => (a||'').slice(0, 6);
+const role = r => r && r !== 'solo' ? '<span class="pill r-'+r+'">'+r+'</span>' : '';
+const copyBtn = a => a ? '<button class="copy" type="button" data-copy="'+a+'" title="copiar CA" aria-label="copiar CA">copiar</button>' : '';
+let picked = '';
+let lastWatch = [];
+let uniReady = false;
+let inflight = false;
 
-function rows(el, items, html, empty) {
+function watchKey(w) { return w.chain+':'+w.address; }
+function watchSig(w) {
+  const r = w.rubric || {};
+  return [w.symbol, w.call, w.cert, w.label, w.role, w.dex_paid, w.dex_photo, w.dex_aligned,
+    (w.kols||[]).join(','), w.tw && w.tw.official, r.total, w.whale_n].join('|');
+}
+function watchBody(w) {
+  const call = w.call || 'scan';
+  const pill = w.label
+    ? '<span class="pill v-'+w.label+'">'+call.toUpperCase()+' '+w.label+'</span>'
+    : '<span class="pill st-'+call+'">'+call.toUpperCase()+'</span>';
+  const whales = w.whale_n == null
+    ? ''
+    : '<div class="meta" data-f="whales">whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)+'</div>';
+  const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
+  return '<div class="wcard-h"><span class="sym">'+(w.symbol || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
+    + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
+    + '<div class="mcap" data-f="mcap">$'+kM(w.mcap)+'</div>'
+    + certHtml(w.cert)+' '+pill+' '+role(w.role)
+    + whales
+    + '<div class="kols">kols '+kols+'</div>'
+    + dexLine(w)
+    + rubricLine(w.rubric)
+    + twLine(w.tw)
+    + '<div data-f="ret" class="'+cls(w.ret_5m)+'">'+pct(w.ret_5m||0)+' · vol '+kM(w.vol5m)+'</div>';
+}
+function fillLive(el, w) {
+  const set = (f, t) => {
+    const n = el.querySelector('[data-f="'+f+'"]');
+    if (n && n.textContent !== t) n.textContent = t;
+  };
+  set('mcap', '$'+kM(w.mcap));
+  set('age', ageTxt(w.age_min));
+  const ret = el.querySelector('[data-f="ret"]');
+  if (ret) {
+    ret.className = cls(w.ret_5m);
+    const t = pct(w.ret_5m||0)+' · vol '+kM(w.vol5m);
+    if (ret.textContent !== t) ret.textContent = t;
+  }
+}
+
+function paintWatch(list, running) {
+  const box = $('watch');
+  if (!box) return;
+  if (!list.length) {
+    box.innerHTML = '<div class="muted">'+(running?'scanning…':'start the bot')+'</div>';
+    return;
+  }
+  if (box.querySelector('.muted') && !box.querySelector('.wcard')) box.innerHTML = '';
+  const have = new Map([...box.querySelectorAll('.wcard')].map(el => [el.dataset.pick, el]));
+  const keep = new Set();
+  list.forEach((w, i) => {
+    const key = watchKey(w);
+    keep.add(key);
+    let el = have.get(key);
+    const sig = watchSig(w);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'wcard pick';
+      el.dataset.pick = key;
+      el.innerHTML = watchBody(w);
+      el.dataset.sig = sig;
+    } else if (el.dataset.sig !== sig) {
+      el.innerHTML = watchBody(w);
+      el.dataset.sig = sig;
+    } else {
+      fillLive(el, w);
+    }
+    const at = box.children[i];
+    if (at !== el) box.insertBefore(el, at || null);
+  });
+  have.forEach((el, key) => { if (!keep.has(key)) el.remove(); });
+}
+
+function paintCoin() {
+  const box = $('coin');
+  if (!box) return;
+  const w = lastWatch.find(x => watchKey(x) === picked);
+  document.querySelectorAll('#watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
+  if (!w) { box.hidden = true; box.innerHTML = ''; box.dataset.pick = ''; return; }
+  box.hidden = false;
+  if (box.dataset.pick === picked && box.querySelector('[data-f=mcap]')) {
+    fillLive(box, w);
+    const why = box.querySelector('[data-f=why]');
+    if (why && why.textContent !== (w.why||'')) why.textContent = w.why||'';
+    return;
+  }
+  box.dataset.pick = picked;
+  const call = (w.call || 'scan').toUpperCase();
+  box.innerHTML = '<div class="coin-h">'
+    + '<div class="sym">'+(w.symbol||'')+'</div>'
+    + '<div class="chain">'+chainShort(w.chain)+'</div>'
+    + '<div class="age" data-f="age">'+ageTxt(w.age_min)+'</div>'
+    + '<div class="mcap" data-f="mcap">$'+kM(w.mcap)+'</div>'
+    + '<div class="fit v-'+(w.label||'')+'">'+(w.fit||0)+'</div>'
+    + '<div class="v-'+(w.label||'')+'">'+(w.label||call)+'</div>'
+    + certHtml(w.cert)
+    + '<span class="pill st-'+(w.call||'scan')+'">'+call+'</span></div>'
+    + '<p class="muted">whales '+(w.whale_n==null?'—':w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0))
+    + ' · kols '+((w.kols&&w.kols.length)?w.kols.join(', '):'—')+'</p>'
+    + dexLine(w)
+    + rubricLine(w.rubric)
+    + twBlock(w.tw)
+    + '<p class="muted" data-f="why">'+(w.why||'')+'</p>'
+    + '<ul>'+(w.signals||[]).map(s => '<li>'+s+'</li>').join('')+'</ul>'
+    + '<p class="muted">Organic não é compra. Bundled = skip. Cabaled na Solana = skip; na Hood o EV decide.</p>';
+}
+
+function setText(id, text, extra) {
+  const el = $(id);
+  if (!el) return;
+  if (el.textContent !== text) el.textContent = text;
+  if (extra != null) el.className = extra;
+}
+
+function mcapPath(a, b) {
+  if (!a && !b) return '—';
+  return '$'+(a?kM(a):'—')+' → $'+(b?kM(b):'—');
+}
+
+function rows(el, items, html, empty, cols) {
   const body = el.querySelector('tbody');
-  body.innerHTML = items.length ? items.map(html).join('') : '<tr><td class="muted" colspan="5">'+(empty||'none')+'</td></tr>';
+  const next = items.length ? items.map(html).join('')
+    : '<tr><td class="muted" colspan="'+(cols||6)+'">'+(empty||'none')+'</td></tr>';
+  if (body.innerHTML !== next) body.innerHTML = next;
 }
 
 function chainCard(c) {
   const pads = (c.launchpads||[]).join(', ') || '—';
   const extra = [];
-  if (c.min_volume_5m) extra.push('vol ≥ '+compact(c.min_volume_5m));
+  if (c.min_volume_5m) extra.push('vol ≥ '+kM(c.min_volume_5m));
   if (c.min_twitter) extra.push('twitter ≥ '+c.min_twitter);
-  extra.push('copy <'+c.copy_max_age_min+'m · $'+(c.copy_max_mcap/1000)+'k');
+  extra.push('copy <'+Math.round(c.copy_max_age_min)+' min · '+kM(c.copy_max_mcap));
   return `<div class="card ${c.enabled?'':'off'}">
     <h2>${c.chain} ${c.enabled?'<span class="pill on">on</span>':'<span class="pill">off</span>'}</h2>
-    <p>${pads} · max ${c.max_age_min}m</p>
+    <p>${pads} · max ${Math.round(c.max_age_min)} min</p>
     <p>${extra.join(' · ')}</p>
     <div class="addr">${c.wallet || 'no wallet'}</div>
   </div>`;
 }
 
+function paintVerdict(d) {
+  const box = $('verdict');
+  const hint = $('verdict-h');
+  const losses = Math.max(0, (d.closed||0) - (d.wins||0));
+  if (!d.closed) {
+    const p = d.best_probability ? ' melhor setup '+Math.round(d.best_probability*100)+'%' : '';
+    box.className = 'verdict wait';
+    box.querySelector('.tag').textContent = 'WAITING';
+    hint.textContent = 'sem trades ainda — paper caçando' + p;
+    return;
+  }
+  if (d.pnl > 0) {
+    box.className = 'verdict up';
+    box.querySelector('.tag').textContent = 'UP';
+    hint.textContent = usd(d.pnl)+' no lucro · '+d.wins+'W / '+losses+'L';
+    return;
+  }
+  if (d.pnl < 0) {
+    box.className = 'verdict dn';
+    box.querySelector('.tag').textContent = 'DOWN';
+    hint.textContent = usd(d.pnl)+' no prejuízo · '+d.wins+'W / '+losses+'L';
+    return;
+  }
+  box.className = 'verdict wait';
+  box.querySelector('.tag').textContent = 'FLAT';
+  hint.textContent = 'zero a zero · '+d.wins+'W / '+losses+'L';
+}
+
+document.addEventListener('click', e => {
+  const tab = e.target.closest('[data-tab]');
+  if (tab) {
+    document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b === tab));
+    document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === tab.dataset.tab));
+    return;
+  }
+  const pick = e.target.closest('[data-pick]');
+  if (pick && !e.target.closest('[data-copy]')) {
+    picked = pick.dataset.pick;
+    paintCoin();
+    return;
+  }
+  const rm = e.target.closest('[data-remove]');
+  if (rm) {
+    fetch('/api/kols', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'remove', address: rm.dataset.remove})}).then(tick);
+    return;
+  }
+  const b = e.target.closest('[data-copy]');
+  if (!b) return;
+  const s = b.dataset.copy;
+  const done = () => { const old = b.textContent; b.textContent = 'ok'; setTimeout(() => { b.textContent = old; }, 700); };
+  const go = (navigator.clipboard && navigator.clipboard.writeText)
+    ? navigator.clipboard.writeText(s) : Promise.reject();
+  go.then(done).catch(() => {
+    const t = document.createElement('textarea');
+    t.value = s; document.body.appendChild(t); t.select();
+    document.execCommand('copy'); t.remove(); done();
+  });
+});
+
+document.getElementById('kol-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = e.target;
+  fetch('/api/kols', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      action: 'add',
+      address: f.address.value.trim(),
+      handle: f.handle.value.trim(),
+      class: f.klass.value
+    })}).then(() => { f.reset(); tick(); });
+});
+
+function sendInspect(addr) {
+  if (!addr) return;
+  fetch('/api/inspect', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({address: addr})}).then(tick);
+}
+$('paste-ca').addEventListener('click', async () => {
+  let v = $('ca-in').value.trim();
+  if (!v && navigator.clipboard && navigator.clipboard.readText) {
+    try { v = (await navigator.clipboard.readText()).trim(); $('ca-in').value = v; } catch (e) {}
+  }
+  sendInspect(v);
+});
+$('ca-in').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); sendInspect($('ca-in').value.trim()); }
+});
+
+function paintKols(list) {
+  rows($('kols'), list||[], k => `<tr>
+    <td class="sym">${k.handle || '—'}</td>
+    <td class="muted">${k.class || 'kol'}</td>
+    <td class="muted">${k.chain || '—'}</td>
+    <td class="ca">${caHead(k.address)} ${copyBtn(k.address)}</td>
+    <td><button class="copy" type="button" data-remove="${k.address}">remove</button></td>
+  </tr>`, 'none followed', 5);
+}
+
+let lastPnlSig = '';
+function paintPnl(chart) {
+  const cards = $('pnl-cards');
+  if (!cards) return;
+  const sig = String((chart&&chart.total)||0)+':'+( ((chart||{}).series||{}).total||[] ).length;
+  if (sig === lastPnlSig) return;
+  lastPnlSig = sig;
+  const by = (chart && chart.by_chain) || {};
+  const tot = chart ? chart.total : 0;
+  const cell = (label, n) => `<div class="card"><h2>${label}</h2><div class="n ${cls(n)}">${usd(n||0)}</div></div>`;
+  cards.innerHTML = cell('total', tot) + cell('solana', by.solana) + cell('bnb', by.bnb) + cell('robinhood', by.robinhood_chain);
+  const svg = $('pnl-chart');
+  let pts = ((chart||{}).series||{}).total || [];
+  if (!pts.length) {
+    svg.innerHTML = '<text x="20" y="120" fill="#6a6a6a" font-size="14">sem trades ainda</text>';
+    return;
+  }
+  if (pts.length === 1) pts = [{t: pts[0].t, y: 0}, pts[0]];
+  const ys = pts.map(p => p.y);
+  const min = Math.min(0, ...ys), max = Math.max(0, ...ys);
+  const span = (max - min) || 1;
+  const w = 800, h = 240, pad = 16;
+  const xy = pts.map((p,i) => {
+    const x = pad + (i/(pts.length-1))*(w-2*pad);
+    const y = pad + (1 - (p.y-min)/span)*(h-2*pad);
+    return x.toFixed(1)+','+y.toFixed(1);
+  });
+  const zero = pad + (1 - (0-min)/span)*(h-2*pad);
+  const last = pts[pts.length-1].y;
+  const color = last>0 ? '#3dff9a' : last<0 ? '#ff3b4e' : '#c8c8c8';
+  svg.innerHTML = '<line x1="0" y1="'+zero+'" x2="'+w+'" y2="'+zero+'" stroke="#222" />'
+    + '<polyline fill="none" stroke="'+color+'" stroke-width="2" points="'+xy.join(' ')+'"/>';
+}
+
 async function tick() {
-  const d = await (await fetch('/api')).json();
+  if (inflight) return;
+  inflight = true;
+  let d;
+  try { d = await (await fetch('/api?'+Date.now(), {cache:'no-store'})).json(); }
+  catch (err) { $('status').textContent = 'offline'; inflight = false; return; }
   const live = d.running ? (d.mode || 'run') : 'stopped';
   const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
-  $('status').textContent = live + halt + ' · stale ' + d.stale_s + 's';
-  $('equity').textContent = usd(d.equity_usd);
-  $('pnl').textContent = usd(d.realized_pnl);
-  $('pnl').className = 'n ' + cls(d.realized_pnl);
-  $('fees').textContent = usd(d.fees_usd);
-  $('closed').textContent = d.closed + (d.closed ? '  ' + d.wins + 'w' : '');
-  $('watching').textContent = d.watching;
-  $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');
-  rows($('watch'), d.watch||[], w => `<tr>
-    <td><div class="sym">${w.symbol || short(w.address||'')}</div><div class="ca">${(w.address||'').slice(0,10)}</div></td>
-    <td class="muted">${w.chain}</td>
-    <td>${w.age_min}m</td>
-    <td>${compact(w.mcap)}</td>
-    <td>${compact(w.vol5m)}</td></tr>`, d.running ? 'scanning…' : 'start the bot to fill this');
-  rows($('holds'), d.holds, h => `<tr>
-    <td class="sym">${h.symbol || short(h.key)}</td>
-    <td>${usd(h.size_usd)}</td>
-    <td class="${cls(h.unrealized_pct)}">${pct(h.unrealized_pct)}</td>
-    <td>${Math.round(h.remaining_pct*100)}%</td>
-    <td class="muted">${h.age_min}m r${h.ladder}</td></tr>`);
-  rows($('sold'), d.sold, t => `<tr>
-    <td class="sym">${short(t.key)}</td>
+  $('status').textContent = live + halt + ' · ' + d.stale_s + 's';
+  setText('equity', usd(d.equity_usd), 'n');
+  setText('pnl', usd(d.pnl), 'n '+cls(d.pnl));
+  setText('winrate', d.win_rate == null ? '—' : Math.round(d.win_rate*100)+'%',
+    'n ' + (d.win_rate == null ? '' : d.win_rate >= 0.5 ? 'up' : 'dn'));
+  setText('avghold', d.avg_hold_min == null ? '—' : mins(d.avg_hold_min), 'n');
+  setText('holding', (d.holding||0) + (d.holding ? '  '+usd(d.holding_usd) : ''), 'n gold');
+  const flow = (d.watch_in||d.watch_out)
+    ? '  +'+ (d.watch_in||0) + ' −' + (d.watch_out||0) : '';
+  setText('watching', String(d.watching||0) + flow, 'n cyan');
+  paintVerdict(d);
+  if (!uniReady) {
+    $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');
+    uniReady = true;
+  }
+  lastWatch = d.watch || [];
+  paintWatch(lastWatch, d.running);
+  paintCoin();
+  rows($('holds'), d.holds||[], h => `<tr>
+    <td>
+      <div class="sym">${h.symbol || caHead(h.address||h.key)} ${role(h.role)}</div>
+      <div class="ca">${chainShort(h.chain||'')} · ${caHead(h.address || (h.key||'').split(':')[1])} ${copyBtn(h.address || (h.key||'').split(':')[1])}</div>
+    </td>
+    <td class="gold">${usd(h.held_usd != null ? h.held_usd : h.size_usd)}</td>
+    <td class="pnl ${cls(h.unrealized_usd != null ? h.unrealized_usd : h.unrealized_pct)}">${usd(h.unrealized_usd||0)} <span class="muted">${pct(h.unrealized_pct)}</span></td>
+    <td>${Math.round((h.remaining_pct||0)*100)}%</td>
+    <td>${mins(h.age_min)}</td>
+    <td class="mcap-path">${mcapPath(h.mcap_entry, h.mcap)}</td>
+    <td>${h.entry_rubric ? (h.entry_rubric+' → '+(h.hold_rubric||'—')) : '—'}<div class="meta">${h.hold_why||''}${h.hold_strikes?(' · '+h.hold_strikes+' strike'):''}</div></td></tr>`, 'none open', 7);
+  rows($('sold'), d.sold||[], t => `<tr>
+    <td>
+      <div class="sym">${t.symbol || caHead((t.key||'').split(':')[1])}</div>
+      <div class="ca">${chainShort(t.chain||'')}</div>
+    </td>
     <td>${usd(t.size_usd)}</td>
-    <td class="${cls(t.pnl_usd)}">${usd(t.pnl_usd)} ${pct(t.pnl_pct)}</td>
-    <td class="muted">${t.exit}</td></tr>`);
+    <td class="pnl ${cls(t.pnl_usd)}">${usd(t.pnl_usd)} <span class="muted">${pct(t.pnl_pct)}</span></td>
+    <td class="mcap-path">${mcapPath(t.mcap_entry, t.mcap_exit)}</td>
+    <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
+    <td class="muted">${t.exit}</td></tr>`, 'none closed', 6);
+  if (!document.activeElement || !document.activeElement.closest('#kol-form')) {
+    paintKols(d.kols);
+  }
+  paintPnl(d.pnl_chart);
+  inflight = false;
 }
 tick();
-setInterval(tick, 3000);
+setInterval(tick, 400);
 </script>
 </body>
 </html>
@@ -261,11 +773,9 @@ def serve(
     strategy: Config | None = None,
 ) -> None:
     def snapshot() -> bytes:
-        fresh = Store(state_dir)
-        try:
-            return json.dumps(assemble(state_dir, fresh, equity, settings, strategy)).encode()
-        finally:
-            fresh.close()
+        # Reuse the process Store. Opening sqlite on every /api poll made the
+        # visor hitch and fight the engine for preview.json.
+        return json.dumps(assemble(state_dir, store, equity, settings, strategy)).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -290,10 +800,64 @@ def serve(
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(HTML.encode())
 
-    httpd = HTTPServer(("127.0.0.1", port), Handler)
+        def do_POST(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n).decode() if n else "{}")
+            except ValueError:
+                body = {}
+            if path == "/api/inspect":
+                addr = str(body.get("address") or "").strip()
+                pending: list = []
+                inspect = state_dir / "inspect.json"
+                if inspect.exists():
+                    try:
+                        pending = json.loads(inspect.read_text(encoding="utf-8"))
+                    except (ValueError, OSError):
+                        pending = []
+                    if not isinstance(pending, list):
+                        pending = [pending]
+                if addr and addr not in pending:
+                    pending.append(addr)
+                inspect.write_text(json.dumps(pending), encoding="utf-8")
+                out = json.dumps({"ok": True, "queued": pending}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+                return
+            if path != "/api/kols":
+                self.send_error(404)
+                return
+            rows = load_kols(state_dir)
+            action = str(body.get("action") or "")
+            addr = str(body.get("address") or "").strip()
+            if action == "add" and addr:
+                rows = [r for r in rows if str(r.get("address")).lower() != addr.lower()]
+                rows.append(
+                    {
+                        "address": addr,
+                        "handle": str(body.get("handle") or "").strip(),
+                        "class": str(body.get("class") or "kol"),
+                        "source": "manual",
+                        "chase": True,
+                    }
+                )
+            elif action == "remove" and addr:
+                rows = [r for r in rows if str(r.get("address")).lower() != addr.lower()]
+            save_kols(state_dir, rows)
+            out = json.dumps({"ok": True, "kols": rows}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(out)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"preview  http://127.0.0.1:{port}/   (ctrl+c to stop)")
     try:
         httpd.serve_forever()
