@@ -175,14 +175,14 @@ ignore_mcap_usd = 50000000
 # ---------------------------------------------------------------------------
 [scoring]
 # Minimum modeled win probability to consider a trade.
-min_probability = 0.54
+min_probability = 0.42
 # Minimum expected value, as a fraction of position size, AFTER subtracting
 # every cost we can predict. A positive score with negative EV is a losing
 # trade with good self-esteem.
-min_expected_value = 0.03
+min_expected_value = 0.0
 # Stage-2 0–10 composite. Weights: dist 20, crowd 25, flow 20, chart 25, narrative 10.
 # Below this the token is not a buy candidate even if EV looks fine.
-min_rubric = 6.0
+min_rubric = 4.0
 # Until this many closed trades exist, the model has no opinion worth acting
 # on and every feature contributes at its prior weight.
 min_trades_for_learned_weights = 40

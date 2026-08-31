@@ -453,12 +453,12 @@ class TestGates(unittest.TestCase):
         pancake = Candidate(chain=Chain.BNB, address="0xdef", dex_id="pancakeswap")
         self.assertFalse(launchpad_origin(pancake, STRATEGY)[0])
 
-    def test_old_token_is_vetoed_even_on_a_launchpad(self):
+    def test_old_token_stays_eligible(self):
         enr = self.enrichment()
         enr.mint = _FakeMint(None, None)
         enr.candidate.created_at_ms = now_ms() - 4 * 60 * 60 * 1000
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
-        self.assertTrue(any(v.startswith("age:") for v in vetoes), vetoes)
+        self.assertFalse(any(v.startswith("age:") for v in vetoes), vetoes)
 
     def test_solana_sponsor_is_optional(self):
         enr = self.enrichment()
@@ -534,7 +534,7 @@ class TestGates(unittest.TestCase):
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("cluster:" in v for v in vetoes), vetoes)
 
-    def test_robinhood_age_window_is_shorter(self):
+    def test_robinhood_age_is_not_an_entry_veto(self):
         enr = self.enrichment()
         enr.mint = _FakeMint(None, None)
         enr.candidate.chain = Chain.ROBINHOOD_CHAIN
@@ -543,7 +543,7 @@ class TestGates(unittest.TestCase):
         enr.candidate.created_at_ms = now_ms() - 90 * 60_000
         enr.features.twitter_mentions = 20
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
-        self.assertTrue(any(v.startswith("age:") for v in vetoes), vetoes)
+        self.assertFalse(any(v.startswith("age:") for v in vetoes), vetoes)
 
     def test_robinhood_silence_on_twitter_vetoes_when_measured(self):
         enr = self.enrichment()
@@ -1563,7 +1563,18 @@ class TestRubric(unittest.TestCase):
                 liquidity_usd=80_000,
                 created_at_ms=now_ms() - 60_000,
             ),
-            features=Features(liquidity_usd=80_000, holder_count=500, top10_pct=0.22, cluster_pct=0.02),
+            features=Features(
+                liquidity_usd=80_000,
+                holder_count=500,
+                top10_pct=0.40,
+                cluster_pct=0.20,
+                gini=0.75,
+                bot_share=0.30,
+                parabolic=0.95,
+                body_ratio=-0.4,
+                unique_buyers_5m=2,
+                buy_sell_ratio=0.4,
+            ),
             round_trip=RoundTrip(ok=True, sell_slippage=0.03, total_cost_pct=0.02),
             crowd={"whale_n": 1, "kols": ["bagu"]},
         )

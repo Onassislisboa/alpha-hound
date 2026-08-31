@@ -707,7 +707,6 @@ class Engine:
                     free_vetoes[0],
                     cheap.unknown,
                 )
-                self._drop_watch(candidate, "gate_skip")
                 return None
 
             try:
@@ -1009,17 +1008,8 @@ class Engine:
                 self.enricher.forget(key)
                 self._tick_counts["beta_dump"] += 1
                 continue
-            # Solo already looked at: 4 min on the visor, then rotate.
-            if (
-                candidate.pack_role in ("", "solo")
-                and candidate.last_scored_ms
-                and now - candidate.last_scored_ms > 240_000
-            ):
-                del self.watching[key]
-                self.enricher.forget(key)
-                continue
             visor_age = float(self.strategy.get("loop.max_candidate_age_minutes", 180))
-            if not candidate.created_at_ms or candidate.age_minutes > visor_age:
+            if candidate.created_at_ms and candidate.age_minutes > visor_age:
                 del self.watching[key]
                 self.enricher.forget(key)
 

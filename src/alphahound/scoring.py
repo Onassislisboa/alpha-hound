@@ -29,7 +29,6 @@ from .portfolio import banked_from_peak
 from .settings import Config
 from .origin import launchpad_origin
 from .playbook import gate as pb_gate
-from .playbook import max_age_minutes as pb_max_age
 from .playbook import section as pb_section
 from .store import Store
 from .rubric import grade
@@ -312,15 +311,10 @@ def evaluate_gates(
     if not allowed:
         vetoes.append(f"launchpad: {origin_reason}")
 
-    # $TRUMP/$MELANIA were the concentration *shape*, not tradable names.
-    # No created_at means we cannot prove this is a new launch.
-    max_age = pb_max_age(strategy, chain)
+    # Age stays on the visor; it is not a buy veto. The watch list is the
+    # selection — paper enters what it already chose.
     if not enr.candidate.created_at_ms:
         abstained.append("age(unmeasured)")
-    elif enr.candidate.age_minutes > max_age:
-        vetoes.append(
-            f"age: {enr.candidate.age_minutes:.0f}m old (max {max_age:.0f}m, new launches only)"
-        )
 
     # Playbook-only floors. Skip when the input was never measured so a missing
     # Twitter key cannot veto every Solana mint.
@@ -332,11 +326,10 @@ def evaluate_gates(
     if min_tw > 0 and "twitter_mentions" not in unknown and f.twitter_mentions < min_tw:
         vetoes.append(f"twitter: {f.twitter_mentions:.0f} mentions (want {min_tw:.0f})")
     tw = getattr(enr, "twitter", None) or {}
-    if tw.get("official") and "official_age_min" in tw:
-        off_age = tw.get("official_age_min")
-        if off_age is None or off_age > 360:
-            age_s = "none" if off_age is None else f"{off_age:.0f}m"
-            vetoes.append(f"twitter: official quiet {age_s}")
+    if tw.get("official") and tw.get("official_age_min") is not None:
+        off_age = float(tw["official_age_min"])
+        if off_age > 360:
+            vetoes.append(f"twitter: official quiet {off_age:.0f}m")
     copy_mcap = float(pb_section(strategy, chain).get("copy_max_mcap_usd", 2_000_000))
     copy_min = float(pb_section(strategy, chain).get("copy_min_mcap_usd", 100_000))
     ripped = enr.candidate.ret_5m > 0.20 or (
