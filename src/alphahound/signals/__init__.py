@@ -408,22 +408,28 @@ class Enricher:
         size_pct = float(self.strategy.get("whales.size_pct", 0.02))
         whale = whales.crowd_read(holders, trades, whale_set, size_pct=size_pct)
         kol_map: dict[str, str] = {}
+        fomo_map: dict[str, str] = {}
         for row in self.whale_rows:
-            klass = str(row.get("class") or "kol").lower()
-            if klass in {"whale", "fomo"}:
-                continue
             addr = str(row.get("address") or "").strip()
             if not addr:
                 continue
-            handle = str(row.get("handle") or "").strip().lstrip("@") or addr[:6]
             key = addr.lower() if addr.startswith("0x") else addr
-            kol_map[key] = handle
+            name = (
+                str(row.get("name") or row.get("handle") or "").strip().lstrip("@") or addr[:6]
+            )
+            source = str(row.get("source") or "").lower()
+            klass = str(row.get("class") or "kol").lower()
+            if source == "fomo" or klass == "fomo":
+                fomo_map[key] = name
+            elif klass != "whale":
+                kol_map[key] = name
         result.crowd = {
             "whale_n": whale.inside,
             "whale_pct": round(whale.hold_pct, 4),
             "whale_usd": round(whale.hold_pct * max(0.0, candidate.mcap_usd)),
             "kols": who_inside(holders, trades, kol_map),
-            "wallets": list(dict.fromkeys([*whale.wallets, *kol_map]))[:16],
+            "fomo": who_inside(holders, trades, fomo_map),
+            "wallets": list(dict.fromkeys([*whale.wallets, *kol_map, *fomo_map]))[:16],
         }
         ignore_mcap = float(self.strategy.get("whales.ignore_mcap_usd", 50_000_000))
         if candidate.mcap_usd > ignore_mcap > 0:

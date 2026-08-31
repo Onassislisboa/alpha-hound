@@ -15,7 +15,7 @@ from typing import Any
 
 from .models import Chain, now_ms
 from .playbook import max_age_minutes
-from .settings import Config, Settings, load_kols, save_kols
+from .settings import Config, Settings, load_fomo, load_kols, save_fomo, save_kols
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
@@ -187,6 +187,7 @@ def assemble(
         "sold": sold,
         "universe": universe(settings, strategy),
         "kols": load_kols(state_dir),
+        "fomo": load_fomo(state_dir),
         "pnl_chart": book["pnl_chart"],
     }
 
@@ -236,6 +237,7 @@ HTML = """<!doctype html>
   .kol-form { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 20px; }
   .kol-form input, .kol-form select { font: inherit; background: #111; color: var(--hi);
                  border: 1px solid #2a2a2a; padding: 6px 8px; border-radius: 4px; }
+  .kol-form input[name="address"] { min-width: 16em; flex: 1 1 16em; }
   .kol-form button { font: inherit; background: #1a1a1a; color: #fff; border: 1px solid #333;
                      padding: 6px 12px; cursor: pointer; }
   #pnl-chart { width: 100%; height: 240px; display: block; }
@@ -337,6 +339,7 @@ HTML = """<!doctype html>
 <nav class="tabs">
   <button type="button" class="on" data-tab="tab-watch">watch</button>
   <button type="button" data-tab="tab-kols">kols</button>
+  <button type="button" data-tab="tab-fomo">fomo</button>
   <button type="button" data-tab="tab-pnl">pnl</button>
 </nav>
 <div id="tab-watch" class="panel on">
@@ -377,6 +380,19 @@ HTML = """<!doctype html>
   <section>
     <table id="kols"><thead><tr>
       <th>handle</th><th>class</th><th>chain</th><th>address</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+</div>
+<div id="tab-fomo" class="panel">
+  <p class="muted" style="padding:14px 20px 0">Perfis da Fomo que você segue. Nome + wallet (várias no mesmo campo, separadas por espaço ou vírgula). O bot não opera na Fomo — copia o sinal on-chain no paper/Jupiter.</p>
+  <form class="kol-form" id="fomo-form">
+    <input name="name" placeholder="nome do perfil" required size="18"/>
+    <input name="address" placeholder="wallets" required/>
+    <button type="submit">seguir</button>
+  </form>
+  <section>
+    <table id="fomo"><thead><tr>
+      <th>nome</th><th>chain</th><th>wallet</th><th></th>
     </tr></thead><tbody></tbody></table>
   </section>
 </div>
@@ -460,7 +476,7 @@ let inflight = false;
 function watchKey(w) { return w.chain+':'+w.address; }
 function watchSig(w) {
   return [w.symbol, w.call, w.cert, w.label, w.role,
-    (w.kols||[]).join(','), w.tw && w.tw.official, w.rubric ? 1 : 0, w.whale_n==null?0:1].join('|');
+    (w.kols||[]).join(','), (w.fomo||[]).join(','), w.tw && w.tw.official, w.rubric ? 1 : 0, w.whale_n==null?0:1].join('|');
 }
 function watchBody(w) {
   const call = w.call || 'scan';
@@ -474,12 +490,14 @@ function watchBody(w) {
     ? ''
     : '<div class="meta" data-f="whales">whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)+'</div>';
   const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
+  const fomo = (w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—';
   return '<div class="wcard-h"><span class="sym">'+(w.symbol || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
     + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
     + '<div class="mcap" data-f="mcap">$'+kM(w.mcap)+'</div>'
     + certHtml(w.cert)+' '+pill+' '+role(w.role)
     + whales
     + '<div class="kols">kols '+kols+'</div>'
+    + '<div class="kols">fomo '+fomo+'</div>'
     + dexLine(w)
     + rubricLine(w.rubric)
     + twLine(w.tw)
@@ -575,7 +593,8 @@ function paintCoin() {
     + certHtml(w.cert)
     + '<span class="pill st-'+(w.call||'scan')+'">'+call+'</span></div>'
     + '<p class="muted">whales '+(w.whale_n==null?'—':w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0))
-    + ' · kols '+((w.kols&&w.kols.length)?w.kols.join(', '):'—')+'</p>'
+    + ' · kols '+((w.kols&&w.kols.length)?w.kols.join(', '):'—')
+    + ' · fomo '+((w.fomo&&w.fomo.length)?w.fomo.join(', '):'—')+'</p>'
     + dexLine(w)
     + rubricLine(w.rubric)
     + twBlock(w.tw)
@@ -658,6 +677,12 @@ document.addEventListener('click', e => {
     paintCoin();
     return;
   }
+  const rmFomo = e.target.closest('[data-fomo-rm]');
+  if (rmFomo) {
+    fetch('/api/fomo', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'remove', address: rmFomo.dataset.fomoRm})}).then(tick);
+    return;
+  }
   const rm = e.target.closest('[data-remove]');
   if (rm) {
     fetch('/api/kols', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -689,6 +714,17 @@ document.getElementById('kol-form').addEventListener('submit', e => {
     })}).then(() => { f.reset(); tick(); });
 });
 
+document.getElementById('fomo-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const f = e.target;
+  fetch('/api/fomo', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      action: 'add',
+      name: f.name.value.trim(),
+      address: f.address.value.trim()
+    })}).then(() => { f.reset(); tick(); });
+});
+
 function sendInspect(addr) {
   if (!addr) return;
   fetch('/api/inspect', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -713,6 +749,15 @@ function paintKols(list) {
     <td class="ca">${caHead(k.address)} ${copyBtn(k.address)}</td>
     <td><button class="copy" type="button" data-remove="${k.address}">remove</button></td>
   </tr>`, 'none followed', 5);
+}
+
+function paintFomo(list) {
+  rows($('fomo'), list||[], k => `<tr>
+    <td class="sym">${k.name || k.handle || '—'}</td>
+    <td class="muted">${k.chain || '—'}</td>
+    <td class="ca">${caHead(k.address)} ${copyBtn(k.address)}</td>
+    <td><button class="copy" type="button" data-fomo-rm="${k.address}">remove</button></td>
+  </tr>`, 'nenhum perfil', 4);
 }
 
 let lastPnlSig = '';
@@ -799,6 +844,9 @@ async function tick() {
   if (!document.activeElement || !document.activeElement.closest('#kol-form')) {
     paintKols(d.kols);
   }
+  if (!document.activeElement || !document.activeElement.closest('#fomo-form')) {
+    paintFomo(d.fomo);
+  }
   paintPnl(d.pnl_chart);
   inflight = false;
 }
@@ -872,6 +920,40 @@ def serve(
                     pending.append(addr)
                 inspect.write_text(json.dumps(pending), encoding="utf-8")
                 out = json.dumps({"ok": True, "queued": pending}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+                return
+            if path == "/api/fomo":
+                rows = load_fomo(state_dir)
+                action = str(body.get("action") or "")
+                raw = str(body.get("address") or "").strip()
+                name = str(body.get("name") or body.get("handle") or "").strip().lstrip("@")
+                if action == "add":
+                    addrs = [
+                        a
+                        for a in raw.replace(";", " ").replace(",", " ").split()
+                        if len(a) >= 32
+                    ]
+                    for addr in addrs:
+                        rows = [r for r in rows if str(r.get("address")).lower() != addr.lower()]
+                        chain = "evm" if addr.startswith("0x") else "solana"
+                        rows.append(
+                            {
+                                "address": addr,
+                                "name": name,
+                                "handle": name,
+                                "class": "fomo",
+                                "source": "fomo",
+                                "chain": chain,
+                                "chase": True,
+                            }
+                        )
+                elif action == "remove" and raw:
+                    rows = [r for r in rows if str(r.get("address")).lower() != raw.lower()]
+                save_fomo(state_dir, rows)
+                out = json.dumps({"ok": True, "fomo": rows}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

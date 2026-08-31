@@ -52,10 +52,9 @@ from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
     Settings,
-    load_kols,
+    chase_rows,
     load_strategy,
     load_terminals,
-    load_whales,
 )
 from .signals import Enricher
 from .signals.pack import apply_tags, dump_beta_keys
@@ -139,7 +138,7 @@ class Engine:
             birdeye=self.birdeye,
             probe=self.router.round_trip,
             fomo=self.fomo,
-            whale_rows=load_whales(),
+            whale_rows=chase_rows(settings.state_dir),
             twitter=self.twitter,
             bubbles=self.bubbles,
         )
@@ -236,7 +235,7 @@ class Engine:
 
     async def _scan_loop(self) -> None:
         async def body() -> None:
-            self.enricher.whale_rows = load_whales() + load_kols(self.settings.state_dir)
+            self.enricher.whale_rows = chase_rows(self.settings.state_dir)
             self.enricher._smart_cache.clear()
             self._drain_inspect()
             found = await self.discovery.poll()

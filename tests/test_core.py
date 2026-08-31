@@ -1210,6 +1210,33 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(rows[0]["address"], "Abc")
         tmp.cleanup()
 
+    def test_fomo_round_trip_and_chase(self):
+        from alphahound.settings import chase_rows, crowd_addresses, load_fomo, save_fomo
+
+        tmp = tempfile.TemporaryDirectory()
+        path = Path(tmp.name)
+        save_fomo(
+            path,
+            [
+                {
+                    "address": "FomoWallet111111111111111111111111111111111",
+                    "name": "alpha",
+                    "handle": "alpha",
+                    "class": "fomo",
+                    "source": "fomo",
+                    "chase": True,
+                }
+            ],
+        )
+        rows = load_fomo(path)
+        self.assertEqual(rows[0]["name"], "alpha")
+        self.assertEqual(
+            crowd_addresses(rows, "fomo"),
+            {"FomoWallet111111111111111111111111111111111"},
+        )
+        self.assertIn(rows[0]["address"], {r["address"] for r in chase_rows(path)})
+        tmp.cleanup()
+
     def test_inspect_keeps_old_token(self):
         from unittest.mock import MagicMock
 

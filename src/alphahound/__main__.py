@@ -21,7 +21,7 @@ from .net import Http
 from .providers import Dexscreener
 from .risk import RiskEngine
 from .scoring import Model
-from .settings import Settings, load_strategy, load_terminals, load_whales
+from .settings import Settings, chase_rows, load_strategy, load_terminals
 from .signals.solana import SolanaReader
 from .signals.terminals import discover_fee_accounts
 from .store import Store
@@ -98,10 +98,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "        contribute nothing. Run: alphahound discover-terminals"
         )
 
-    rows = load_whales()
-    fomo_n = sum(1 for r in rows if str(r.get("source", "")).lower() == "fomo")
+    rows = chase_rows(settings.state_dir)
+    fomo_n = sum(
+        1
+        for r in rows
+        if str(r.get("source", "")).lower() == "fomo" or str(r.get("class", "")).lower() == "fomo"
+    )
     whale_n = len(rows) - fomo_n
-    print(f"  labeled wallets   {whale_n} whale/moby, {fomo_n} fomo (config/whales.toml)")
+    print(f"  labeled wallets   {whale_n} whale/moby, {fomo_n} fomo (whales.toml + visor)")
     print(
         "  fomo research     "
         + ("Cope key set" if settings.cope_api_key else "no COPE_API_KEY; labeled fomo only")

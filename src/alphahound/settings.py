@@ -281,8 +281,7 @@ def whale_addresses(rows: list[dict[str, Any]], *, source: str | None = None) ->
     return out
 
 
-def load_kols(state_dir: Path) -> list[dict[str, Any]]:
-    path = state_dir / "kols.json"
+def _load_json_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
@@ -293,12 +292,31 @@ def load_kols(state_dir: Path) -> list[dict[str, Any]]:
     return [dict(r) for r in rows if str(r.get("address") or "").strip()]
 
 
-def save_kols(state_dir: Path, rows: list[dict[str, Any]]) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path = state_dir / "kols.json"
+def _save_json_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def load_kols(state_dir: Path) -> list[dict[str, Any]]:
+    return _load_json_rows(state_dir / "kols.json")
+
+
+def save_kols(state_dir: Path, rows: list[dict[str, Any]]) -> None:
+    _save_json_rows(state_dir / "kols.json", rows)
+
+
+def load_fomo(state_dir: Path) -> list[dict[str, Any]]:
+    return _load_json_rows(state_dir / "fomo.json")
+
+
+def save_fomo(state_dir: Path, rows: list[dict[str, Any]]) -> None:
+    _save_json_rows(state_dir / "fomo.json", rows)
+
+
+def chase_rows(state_dir: Path) -> list[dict[str, Any]]:
+    return load_whales() + load_kols(state_dir) + load_fomo(state_dir)
 
 
 def crowd_addresses(rows: list[dict[str, Any]], kind: str) -> set[str]:
