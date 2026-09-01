@@ -39,7 +39,7 @@ from alphahound.models import (  # noqa: E402
     now_ms,
 )
 from alphahound.portfolio import PositionManager, banked_from_peak  # noqa: E402
-from alphahound.risk import RiskEngine, kelly_fraction  # noqa: E402
+from alphahound.risk import RiskEngine, kelly_fraction, mcap_position_pct  # noqa: E402
 from alphahound.scoring import (  # noqa: E402
     Model,
     Payoff,
@@ -602,11 +602,49 @@ class TestRisk(unittest.TestCase):
     def test_thin_pool_binds_before_the_equity_cap(self):
         score = Score(probability=0.90, expected_value=0.5)
         payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
-        thin = Candidate(chain=Chain.SOLANA, address="a", liquidity_usd=2_000.0, price_usd=1.0)
+        thin = Candidate(
+            chain=Chain.SOLANA,
+            address="a",
+            liquidity_usd=2_000.0,
+            price_usd=1.0,
+            mcap_usd=2_000_000.0,
+        )
         sizing = self.risk.size(thin, score, payoff, [])
         self.assertTrue(sizing.allowed)
         self.assertEqual(sizing.binding_constraint, "pool_liquidity")
         self.assertLessEqual(sizing.size_usd, 2_000.0 * 0.008 + 1e-9)
+
+    def test_mcap_scales_size_with_the_bankroll(self):
+        self.assertAlmostEqual(
+            mcap_position_pct(100_000, 100_000, 2_000_000, 0.06, 0.16), 0.06
+        )
+        self.assertAlmostEqual(
+            mcap_position_pct(2_000_000, 100_000, 2_000_000, 0.06, 0.16), 0.16
+        )
+        score = Score(probability=0.90, expected_value=0.5)
+        payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
+        lo = Candidate(
+            chain=Chain.SOLANA,
+            address="lo",
+            liquidity_usd=10**7,
+            price_usd=1.0,
+            mcap_usd=100_000.0,
+        )
+        hi = Candidate(
+            chain=Chain.SOLANA,
+            address="hi",
+            liquidity_usd=10**7,
+            price_usd=1.0,
+            mcap_usd=2_000_000.0,
+        )
+        a = self.risk.size(lo, score, payoff, [])
+        b = self.risk.size(hi, score, payoff, [])
+        self.assertTrue(a.allowed and b.allowed)
+        self.assertEqual(a.binding_constraint, "mcap_size")
+        self.assertEqual(b.binding_constraint, "mcap_size")
+        self.assertAlmostEqual(a.size_usd, self.risk.equity() * 0.06, places=4)
+        self.assertAlmostEqual(b.size_usd, self.risk.equity() * 0.16, places=4)
+        self.assertGreater(b.size_usd, a.size_usd)
 
     def test_kill_switch_stops_sizing(self):
         self.risk.engage_kill_switch("test")
@@ -730,20 +768,25 @@ class TestExits(unittest.TestCase):
 
     def test_time_stop_releases_dead_capital(self):
         position = self.position()
-        position.opened_at_ms = now_ms() - 90 * 60_000
+        position.opened_at_ms = now_ms() - 250 * 60_000
         orders = self.manager.evaluate(position, 1.02, 100_000.0)
         self.assertIs(orders[0].reason, ExitReason.TIME_STOP)
 
-    def test_thesis_cut_dumps_the_spike_before_first_rung(self):
+    def test_fresh_hold_does_not_thesis_cut(self):
         position = self.position()
         self.manager.observe(position, 1.30, 100_000.0)
-        # ~29% off peak, still above the 22% hard stop from entry.
-        orders = self.manager.evaluate(position, 0.92, 100_000.0)
+        self.assertEqual(self.manager.evaluate(position, 0.75, 100_000.0), [])
+        position = self.position()
+        position.opened_at_ms = now_ms() - 26 * 60_000
+        self.manager.observe(position, 1.30, 100_000.0)
+        # 42% off peak, still above the 35% hard stop from entry.
+        orders = self.manager.evaluate(position, 0.75, 100_000.0)
         self.assertEqual(len(orders), 1)
         self.assertIs(orders[0].reason, ExitReason.THESIS_CUT)
 
     def test_tape_flip_sells_with_the_5m(self):
         position = self.position()
+        position.opened_at_ms = now_ms() - 26 * 60_000
         position.candidate.ret_5m = -0.15
         orders = self.manager.evaluate(position, 1.12, 100_000.0)
         self.assertEqual(len(orders), 1)
@@ -1624,7 +1667,7 @@ class TestHold(unittest.TestCase):
             entry_price=1.0,
             size_usd=20,
             tokens=20,
-            opened_at_ms=now_ms() - 200_000,
+            opened_at_ms=now_ms() - 26 * 60_000,
             entry_sponsors=["bagu"],
         )
         args.update(kw)
@@ -1670,7 +1713,7 @@ class TestHold(unittest.TestCase):
         enr = Enrichment(candidate=pos.candidate, features=Features())
         self.assertIsNone(hold_cut(pos, enr, score, STRATEGY).cut)
 
-    def test_rubric_needs_two_strikes(self):
+    def test_rubric_needs_four_strikes(self):
         from alphahound.scoring import hold_cut
 
         pos = self._pos()
@@ -1682,7 +1725,8 @@ class TestHold(unittest.TestCase):
             features=Features(copy_signal=1.0),
             crowd={"whale_n": 1, "kols": ["bagu"], "wallets": []},
         )
-        self.assertIsNone(hold_cut(pos, enr, score, STRATEGY).cut)
+        for _ in range(3):
+            self.assertIsNone(hold_cut(pos, enr, score, STRATEGY).cut)
         self.assertIn("rubric: hold", hold_cut(pos, enr, score, STRATEGY).cut or "")
 
     def test_sponsor_left_cuts(self):
@@ -1697,7 +1741,7 @@ class TestHold(unittest.TestCase):
         )
         self.assertIn("sponsor:", hold_cut(pos, enr, score, STRATEGY).cut or "")
 
-    def test_parabolic_after_entry_cuts(self):
+    def test_parabolic_after_entry_does_not_cut(self):
         from alphahound.scoring import hold_cut
 
         pos = self._pos()
@@ -1707,7 +1751,16 @@ class TestHold(unittest.TestCase):
             features=Features(parabolic=0.8, copy_signal=1.0),
             crowd={"whale_n": 1, "kols": ["bagu"], "wallets": []},
         )
-        self.assertIn("parabolic", hold_cut(pos, enr, score, STRATEGY).cut or "")
+        self.assertIsNone(hold_cut(pos, enr, score, STRATEGY).cut)
+
+
+class TestDeadMcap(unittest.TestCase):
+    def test_sub_40k_is_dead_zero_is_not(self):
+        from alphahound.engine import mcap_is_dead
+
+        self.assertTrue(mcap_is_dead(39_999, 40_000))
+        self.assertFalse(mcap_is_dead(40_000, 40_000))
+        self.assertFalse(mcap_is_dead(0, 40_000))
 
 
 if __name__ == "__main__":

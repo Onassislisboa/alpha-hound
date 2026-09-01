@@ -1,4 +1,6 @@
-# alpha-hound
+# FirstKill
+
+Paper bot for **new** launchpad memecoins. Package name stays `alphahound`.
 
 A multi-chain trading bot that hunts tokens **before** the retail wave arrives, sizes
 every trade by expected value net of real costs, and rewrites its own scoring

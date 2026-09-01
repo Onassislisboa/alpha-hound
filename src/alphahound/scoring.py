@@ -339,6 +339,9 @@ def evaluate_gates(
         vetoes.append(f"mcap: {enr.candidate.mcap_usd:.0f} below {copy_min:.0f} floor")
     if copy_mcap > 0 and enr.candidate.mcap_usd > copy_mcap and ripped:
         vetoes.append("priced: mcap already past copy window")
+    max_chase = float(pb_section(strategy, chain).get("max_chase_ret_5m", 0) or 0)
+    if max_chase > 0 and enr.candidate.ret_5m > max_chase:
+        vetoes.append("chase: 5m ripped, wait dip")
     max_cluster = p("max_cluster_pct", 0.0)
     if max_cluster > 0 and "cluster_pct" not in unknown and f.cluster_pct > max_cluster:
         vetoes.append(f"cluster: {f.cluster_pct:.0%} linked supply")
@@ -554,16 +557,6 @@ def _hold_sponsor(position: Position, enr: Enrichment) -> str | None:
     return None
 
 
-def _hold_structure(position: Position, enr: Enrichment) -> str | None:
-    if position.ladder_filled:
-        return None
-    if "parabolic" in enr.unknown:
-        return None
-    if enr.features.parabolic >= 0.60:
-        return "chart: went parabolic after entry"
-    return None
-
-
 def _hold_rubric(position: Position, total: float, strategy: Config) -> str | None:
     min_hold = float(strategy.get("hold.min_rubric", 5.5))
     need = int(strategy.get("hold.strikes", 2))
@@ -579,10 +572,12 @@ def _hold_rubric(position: Position, total: float, strategy: Config) -> str | No
 def hold_cut(
     position: Position, enr: Enrichment, score: Score, strategy: Config
 ) -> HoldReview:
-    """Stage 3: lethal → sponsor → structure → rubric. Same order as entry."""
+    """Stage 3: lethal immediately, thesis (sponsor/rubric) only after grace."""
     total = float((score.rubric or {}).get("total") or 0.0)
     entry = position.entry_rubric
-    grace_ms = int(float(strategy.get("hold.grace_seconds", 90)) * 1000)
+    lethal_grace_ms = int(float(strategy.get("hold.lethal_grace_seconds", 90)) * 1000)
+    thesis_grace_ms = int(float(strategy.get("hold.grace_seconds", 90)) * 1000)
+    age_ms = now_ms() - position.opened_at_ms
 
     def review(cut: str | None, why: str) -> HoldReview:
         return HoldReview(
@@ -593,18 +588,17 @@ def hold_cut(
             why=why,
         )
 
-    if now_ms() - position.opened_at_ms < grace_ms:
+    if age_ms < lethal_grace_ms:
         return review(None, "grace")
 
     lethal = _hold_lethal(score.veto_reasons)
     if lethal:
         return review(lethal, lethal)
+    if age_ms < thesis_grace_ms:
+        return review(None, "grace")
     sponsor = _hold_sponsor(position, enr)
     if sponsor:
         return review(sponsor, sponsor)
-    structure = _hold_structure(position, enr)
-    if structure:
-        return review(structure, structure)
     dropped = _hold_rubric(position, total, strategy)
     line = f"{entry:.1f}→{total:.1f}"
     if dropped:

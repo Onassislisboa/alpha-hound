@@ -21,11 +21,27 @@ from datetime import datetime, timezone
 
 from .log import get
 from .models import Candidate, Position, Score, now_ms
+from .playbook import section as pb_section
 from .scoring import Payoff
 from .settings import Config
 from .store import Store
 
 log = get("risk")
+
+
+def mcap_position_pct(
+    mcap_usd: float,
+    lo_mcap: float,
+    hi_mcap: float,
+    p_lo: float,
+    p_hi: float,
+) -> float:
+    """Bigger mcap (inside the copy window) → bigger fraction of the bankroll."""
+    if mcap_usd <= 0 or hi_mcap <= lo_mcap:
+        return p_lo
+    t = min(1.0, max(0.0, (mcap_usd - lo_mcap) / (hi_mcap - lo_mcap)))
+    return p_lo + t * (p_hi - p_lo)
+
 
 KILL_SWITCH_KEY = "kill_switch"
 COOLDOWN_UNTIL_KEY = "cooldown_until_ms"
@@ -164,9 +180,16 @@ class RiskEngine:
         fraction = kelly * self._p("kelly_fraction", 0.25)
         constraint = "kelly"
 
-        cap_pct = self._p("max_position_pct", 0.05)
+        pb = pb_section(self.strategy, candidate.chain)
+        cap_pct = mcap_position_pct(
+            candidate.mcap_usd,
+            float(pb.get("copy_min_mcap_usd", 100_000)),
+            float(pb.get("copy_max_mcap_usd", 2_000_000)),
+            self._p("min_position_pct", 0.06),
+            self._p("max_position_pct", 0.16),
+        )
         if fraction > cap_pct:
-            fraction, constraint = cap_pct, "max_position_pct"
+            fraction, constraint = cap_pct, "mcap_size"
         if fraction <= 0:
             return Sizing(
                 allowed=False,

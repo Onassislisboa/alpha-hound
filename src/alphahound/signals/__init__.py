@@ -27,7 +27,7 @@ from ..playbook import copy_signal as copy_flag
 from ..settings import Config, crowd_addresses, whale_addresses
 from ..store import Store
 from . import chart, flow, terminals, whales
-from .distribution import HolderStats, analyze, holder_growth
+from .distribution import Holder, HolderStats, analyze, holder_growth
 from .terminals import Attribution, ShareTracker, TerminalRegistry
 from .whales import who_inside
 
@@ -82,6 +82,7 @@ class Enricher:
         whale_rows: list | None = None,
         twitter: Twitter | None = None,
         bubbles: Bubblemaps | None = None,
+        evm_rpcs: dict | None = None,
     ) -> None:
         self.store = store
         self.strategy = strategy
@@ -95,6 +96,7 @@ class Enricher:
         self.whale_rows: list = whale_rows or []
         self.twitter = twitter
         self.bubbles = bubbles
+        self.evm_rpcs: dict = evm_rpcs or {}
 
         self.shares = ShareTracker()
         self._holder_history: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -232,7 +234,9 @@ class Enricher:
     ) -> dict[str, float]:
         if candidate.chain is Chain.SOLANA and self.solana is not None:
             return await self._solana_features(candidate, result)
-        return self._aggregate_only_features(candidate, result)
+        values = self._aggregate_only_features(candidate, result)
+        values.update(await self._evm_labeled_crowd(candidate, result))
+        return values
 
     async def _solana_features(
         self, candidate: Candidate, result: Enrichment
@@ -402,10 +406,12 @@ class Enricher:
         holders: list,
         trades: list[flow.Trade],
         result: Enrichment,
+        size_pct: float | None = None,
     ) -> dict[str, float]:
         values: dict[str, float] = {}
         whale_set = crowd_addresses(self.whale_rows, "whale")
-        size_pct = float(self.strategy.get("whales.size_pct", 0.02))
+        if size_pct is None:
+            size_pct = float(self.strategy.get("whales.size_pct", 0.02))
         whale = whales.crowd_read(holders, trades, whale_set, size_pct=size_pct)
         kol_map: dict[str, str] = {}
         fomo_map: dict[str, str] = {}
@@ -587,6 +593,50 @@ class Enricher:
             "avg_buy_size_usd": avg,
             "net_inflow_usd_5m": snap.volume_m5 * (ratio - 1.0) / (ratio + 1.0) if ratio else 0.0,
         }
+
+    async def _evm_labeled_crowd(
+        self, candidate: Candidate, result: Enrichment
+    ) -> dict[str, float]:
+        """balanceOf on labeled KOL/Fomo wallets. Full holder lists need an indexer."""
+        rpc = self.evm_rpcs.get(candidate.chain)
+        addrs = []
+        seen: set[str] = set()
+        for row in self.whale_rows:
+            addr = str(row.get("address") or "").strip()
+            key = addr.lower()
+            if not addr.startswith("0x") or key in seen:
+                continue
+            seen.add(key)
+            addrs.append(addr)
+        if rpc is None or not addrs:
+            result.notes.append(
+                f"{candidate.chain.value}: KOL check skipped ({'no rpc' if rpc is None else 'no labeled evm wallets'})"
+            )
+            return {}
+
+        async def one(addr: str):
+            try:
+                bal = await rpc.balance_of(candidate.address, addr)
+            except Exception as exc:  # noqa: BLE001
+                result.notes.append(f"balanceOf {addr[:8]}: {exc}")
+                return None
+            if bal > 0:
+                return Holder(address=addr, balance=float(bal))
+            return None
+
+        found = await asyncio.gather(*(one(a) for a in addrs[:32]))
+        holders = [h for h in found if h is not None]
+        extra = await self._crowd_features(candidate, holders, [], result, size_pct=0.0)
+        result.unknown.discard("fomo_inside")
+        extra["fomo_inside"] = float(len((result.crowd or {}).get("fomo") or []))
+        extra.pop("whale_hold_pct", None)
+        extra.pop("whale_net_flow", None)
+        extra.pop("fomo_net_flow", None)
+        result.unknown.update({"whale_hold_pct", "whale_net_flow", "fomo_net_flow"})
+        result.notes.append(
+            f"labeled holders: {len(holders)}/{len(addrs)} KOL/fomo wallets have a bag"
+        )
+        return extra
 
     # -- cost --------------------------------------------------------------
     async def _cost_features(

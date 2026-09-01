@@ -82,11 +82,16 @@ class PositionManager:
         if gain <= -stop:
             return [ExitOrder(1.0, ExitReason.STOP_LOSS, f"{gain:.1%} vs stop -{stop:.1%}")]
 
+        age_minutes = (now_ms() - position.opened_at_ms) / 60_000.0
+        # ponytail: a 1m wick is not a falsified thesis; wait this long first.
+        min_thesis = self._p("thesis_cut_min_minutes", 20.0)
+
         # Frank: the spike died before we banked initials. Off-peak cut, only
         # while still above the hard stop — otherwise the stop already fired.
         cut = pb_thesis_cut(self.strategy, position.candidate.chain)
         if (
-            cut > 0
+            age_minutes >= min_thesis
+            and cut > 0
             and position.ladder_filled == 0
             and position.peak_price > position.entry_price * 1.08
             and price <= position.peak_price * (1.0 - cut)
@@ -101,7 +106,7 @@ class PositionManager:
             ]
 
         tape = position.candidate.ret_5m
-        if gain > 0.08 and tape <= -0.12:
+        if age_minutes >= min_thesis and gain > 0.08 and tape <= -0.12:
             return [
                 ExitOrder(1.0, ExitReason.THESIS_CUT, "5m flipped, selling with tape")
             ]
@@ -144,7 +149,6 @@ class PositionManager:
                     )
                 ]
 
-        age_minutes = (now_ms() - position.opened_at_ms) / 60_000.0
         time_stop = self._p("time_stop_minutes", 45.0)
         min_gain = self._p("time_stop_min_gain", 0.15)
         if age_minutes >= time_stop and gain < min_gain:

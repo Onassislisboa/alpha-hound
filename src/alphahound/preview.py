@@ -386,12 +386,13 @@ HTML = """<!doctype html>
 <div id="tab-fomo" class="panel">
   <p class="muted" style="padding:14px 20px 0">Perfis da Fomo que você segue. Nome + wallet (várias no mesmo campo, separadas por espaço ou vírgula). O bot não opera na Fomo — copia o sinal on-chain no paper/Jupiter.</p>
   <form class="kol-form" id="fomo-form">
-    <input name="name" placeholder="nome do perfil" required size="18"/>
-    <input name="address" placeholder="wallets" required/>
+    <input name="handle" placeholder="nome do perfil" required size="18" autocomplete="off"/>
+    <input name="address" placeholder="wallets" required autocomplete="off"/>
     <button type="submit">seguir</button>
   </form>
+  <p id="fomo-err" class="muted" style="padding:0 20px"></p>
   <section>
-    <table id="fomo"><thead><tr>
+    <table id="fomo-rows"><thead><tr>
       <th>nome</th><th>chain</th><th>wallet</th><th></th>
     </tr></thead><tbody></tbody></table>
   </section>
@@ -465,7 +466,11 @@ function rubricLine(r) {
     + '</div></div>';
 }
 const mins = n => ageTxt(n);
-const caHead = a => (a||'').slice(0, 6);
+const caHead = a => {
+  a = String(a||'');
+  if (a.startsWith('0x') && a.length >= 10) return a.slice(0, 6)+'…'+a.slice(-4);
+  return a.slice(0, 6);
+};
 const role = r => r && r !== 'solo' ? '<span class="pill r-'+r+'">'+r+'</span>' : '';
 const copyBtn = a => a ? '<button class="copy" type="button" data-copy="'+a+'" title="copiar CA" aria-label="copiar CA">copiar</button>' : '';
 let picked = '';
@@ -500,6 +505,7 @@ function watchBody(w) {
     + '<div class="kols">fomo '+fomo+'</div>'
     + dexLine(w)
     + rubricLine(w.rubric)
+    + (w.why && w.why !== 'ok' ? '<div class="meta" data-f="why">'+w.why+'</div>' : '')
     + twLine(w.tw)
     + '<div data-f="ret" class="'+cls(w.ret_5m)+'">'+pct(w.ret_5m||0)+' · vol '+kM(w.vol5m)+'</div>';
 }
@@ -705,24 +711,33 @@ document.addEventListener('click', e => {
 document.getElementById('kol-form').addEventListener('submit', e => {
   e.preventDefault();
   const f = e.target;
+  const fd = new FormData(f);
   fetch('/api/kols', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       action: 'add',
-      address: f.address.value.trim(),
-      handle: f.handle.value.trim(),
-      class: f.klass.value
-    })}).then(() => { f.reset(); tick(); });
+      address: String(fd.get('address')||'').trim(),
+      handle: String(fd.get('handle')||'').trim(),
+      class: String(fd.get('klass')||'kol')
+    })}).then(r => r.json()).then(j => { f.reset(); paintKols(j.kols); });
 });
 
 document.getElementById('fomo-form').addEventListener('submit', e => {
   e.preventDefault();
   const f = e.target;
+  const fd = new FormData(f);
+  const err = $('fomo-err');
+  err.textContent = '';
   fetch('/api/fomo', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       action: 'add',
-      name: f.name.value.trim(),
-      address: f.address.value.trim()
-    })}).then(() => { f.reset(); tick(); });
+      name: String(fd.get('handle')||'').trim(),
+      handle: String(fd.get('handle')||'').trim(),
+      address: String(fd.get('address')||'').trim()
+    })}).then(r => r.json()).then(j => {
+      if (!j.ok) { err.textContent = j.error || 'wallet nao gravou — cola o 0x completo'; return; }
+      f.reset();
+      paintFomo(j.fomo);
+    }).catch(() => { err.textContent = 'falhou o save'; });
 });
 
 function sendInspect(addr) {
@@ -752,7 +767,7 @@ function paintKols(list) {
 }
 
 function paintFomo(list) {
-  rows($('fomo'), list||[], k => `<tr>
+  rows($('fomo-rows'), list||[], k => `<tr>
     <td class="sym">${k.name || k.handle || '—'}</td>
     <td class="muted">${k.chain || '—'}</td>
     <td class="ca">${caHead(k.address)} ${copyBtn(k.address)}</td>
@@ -841,12 +856,8 @@ async function tick() {
     <td class="mcap-path">${mcapPath(t.mcap_entry, t.mcap_exit)}</td>
     <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
     <td class="muted">${t.exit}</td></tr>`, 'none closed', 6);
-  if (!document.activeElement || !document.activeElement.closest('#kol-form')) {
-    paintKols(d.kols);
-  }
-  if (!document.activeElement || !document.activeElement.closest('#fomo-form')) {
-    paintFomo(d.fomo);
-  }
+  paintKols(d.kols);
+  paintFomo(d.fomo);
   paintPnl(d.pnl_chart);
   inflight = false;
 }
@@ -934,8 +945,15 @@ def serve(
                     addrs = [
                         a
                         for a in raw.replace(";", " ").replace(",", " ").split()
-                        if len(a) >= 32
+                        if len(a) >= 32 or (a.startswith("0x") and len(a) >= 40)
                     ]
+                    if action == "add" and not addrs:
+                        out = json.dumps({"ok": False, "error": "need a wallet", "fomo": rows}).encode()
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(out)
+                        return
                     for addr in addrs:
                         rows = [r for r in rows if str(r.get("address")).lower() != addr.lower()]
                         chain = "evm" if addr.startswith("0x") else "solana"

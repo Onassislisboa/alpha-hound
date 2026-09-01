@@ -27,6 +27,7 @@ from typing import IO, Any
 from . import learning
 from .discovery import Discovery
 from .execution import ExecutionError, Router, build_router
+from .execution.evm import EvmRpc
 from .log import get
 from .models import (
     Action,
@@ -47,6 +48,7 @@ from .portfolio import ExitOrder, PositionManager
 from .preview import write_preview
 from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
+from .rubric import grade
 from .scoring import Model, Scorer, hold_cut
 from .settings import (
     PUBLIC_SOLANA_RPC,
@@ -64,6 +66,10 @@ from .store import Store, features_from_json, lock_state_dir
 from .verdict import security_cert
 
 log = get("engine")
+
+
+def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
+    return floor > 0 and 0 < mcap_usd < floor
 
 
 def _crowd_sponsors(crowd: dict | None) -> list[str]:
@@ -123,6 +129,11 @@ class Engine:
             if rpc and Chain.SOLANA in settings.enabled_chains
             else None
         )
+        evm_rpcs = {
+            chain: EvmRpc(self.http, url)
+            for chain, url in settings.rpc_urls.items()
+            if url
+        }
 
         self.router: Router = build_router(
             settings, self.strategy, self.dex, self.http, store=self.store
@@ -141,6 +152,7 @@ class Engine:
             whale_rows=chase_rows(settings.state_dir),
             twitter=self.twitter,
             bubbles=self.bubbles,
+            evm_rpcs=evm_rpcs,
         )
         self.scorer = Scorer(Model.load(self.store), self.strategy, self.store, live=settings.live)
         self.risk = RiskEngine(self.strategy, self.store)
@@ -229,6 +241,7 @@ class Engine:
     async def _quote_loop(self) -> None:
         async def body() -> None:
             await self._refresh_watch_quotes()
+            self._prune_watching()
             self._write_preview()
 
         await self._every(float(self.strategy.get("loop.quote_seconds", 1.0)), body, "quotes")
@@ -240,11 +253,14 @@ class Engine:
             self._drain_inspect()
             found = await self.discovery.poll()
             before = set(self.watching)
+            dead_floor = float(self.strategy.get("loop.dead_mcap_usd", 40_000))
             for candidate in found:
                 prev = self.watching.get(candidate.key)
                 if prev is not None:
                     candidate.last_scored_ms = prev.last_scored_ms
                 if candidate.pack_role == "vamp":
+                    continue
+                if mcap_is_dead(candidate.mcap_usd, dead_floor):
                     continue
                 if candidate.source != "inspect":
                     cheap = self.enricher.free_enrichment(candidate)
@@ -623,12 +639,7 @@ class Engine:
     async def score_and_enter(self) -> None:
         if not self.watching:
             return
-        halted, reason = self.risk.halted()
-        if halted:
-            log.debug("not entering", extra={"reason": reason})
-            return
 
-        limit = int(self.strategy.get("loop.max_candidates_per_tick", 8))
         now = now_ms()
 
         def _attention(c: Candidate) -> tuple:
@@ -639,42 +650,34 @@ class Engine:
             vol = -c.volume_5m_usd
             return (unseen, 0 if c.dex_paid else 1, stale, vol)
 
+        # Every visor card gets a note. Halt only blocks the fill, not the grade.
         ranked = [
             c
             for c in sorted(self.watching.values(), key=_attention)
             if c.key not in self.positions
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
-        ][:limit]
+        ]
 
         probe_size = max(
             float(self.strategy.get("risk.min_position_usd", 15.0)),
             self.risk.equity() * float(self.strategy.get("risk.max_position_pct", 0.05)),
         )
 
-        # The ranking goes stale as new candidates arrive, so a pass stops after
-        # its budget and lets the next one re-rank rather than working through a
-        # list that was ordered minutes ago. Unscanned candidates stay in
-        # `watching`; nothing is lost by stopping early.
-        deadline = now_ms() + int(
-            1000 * float(self.strategy.get("loop.entry_scan_budget_seconds", 20.0))
-        )
         n = max(1, int(self.strategy.get("loop.enrich_concurrency", 4)))
         sem = asyncio.Semaphore(n)
 
         async def guarded(candidate: Candidate):
             async with sem:
-                if now_ms() > deadline:
-                    self._tick_counts["scan_budget_spent"] += 1
-                    return None
                 return await self._score_one(candidate, probe_size)
 
         scored = await asyncio.gather(*(guarded(c) for c in ranked), return_exceptions=True)
+        halted, _reason = self.risk.halted()
         for item in scored:
             if isinstance(item, Exception):
                 log.debug("score failed", extra={"error": str(item)})
                 continue
-            if not item:
+            if not item or halted:
                 continue
             decision, buyers, sponsors = item
             decision_id = self.store.record_decision(decision)
@@ -684,7 +687,13 @@ class Engine:
         self, candidate: Candidate, probe_size: float
     ) -> tuple[Decision, list[str], list[str]] | None:
         self._inflight.add(candidate.key)
+        painted = False
         try:
+            if mcap_is_dead(
+                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
+            ):
+                self._drop_watch(candidate, "dead_mcap")
+                return None
             if candidate.pack_role == "vamp":
                 self._drop_watch(candidate, "vamp")
                 return None
@@ -706,6 +715,13 @@ class Engine:
                     free_vetoes[0],
                     cheap.unknown,
                 )
+                self._paint_watch(
+                    candidate,
+                    call="skip",
+                    why=free_vetoes[0],
+                    rubric=grade(cheap, self.store, self.strategy).as_visor(),
+                )
+                painted = True
                 return None
 
             try:
@@ -713,6 +729,7 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 self._tick_counts["enrich_failed"] += 1
                 log.debug("enrich failed", extra={"key": candidate.key, "error": str(exc)})
+                self._paint_watch(candidate, call="scan", why=f"enrich: {exc}"[:80])
                 return None
 
             self._tick_counts["enriched"] += 1
@@ -735,6 +752,7 @@ class Engine:
                 "tw": enrichment.twitter or {},
                 "rubric": score.rubric or {},
             }
+            painted = True
             if not ok:
                 action = Action.REJECT_GATE if score.vetoed else Action.REJECT_SCORE
                 self._tick_counts[
@@ -770,8 +788,24 @@ class Engine:
             )
             return decision, enrichment.buyers, _crowd_sponsors(enrichment.crowd)
         finally:
-            candidate.last_scored_ms = now_ms()
+            if painted:
+                candidate.last_scored_ms = now_ms()
             self._inflight.discard(candidate.key)
+
+    def _paint_watch(
+        self,
+        candidate: Candidate,
+        *,
+        call: str,
+        why: str,
+        rubric: dict | None = None,
+    ) -> None:
+        rec = dict(self._reads.get(candidate.key) or {})
+        rec["call"] = call
+        rec["why"] = why
+        if rubric is not None:
+            rec["rubric"] = rubric
+        self._reads[candidate.key] = rec
 
     def _record(
         self,
@@ -994,8 +1028,12 @@ class Engine:
                     self.enricher.forget(key)
                 continue
             if ignore_mcap > 0 and candidate.mcap_usd > ignore_mcap:
-                del self.watching[key]
-                self.enricher.forget(key)
+                self._drop_watch(candidate, "fat_mcap")
+                continue
+            if mcap_is_dead(
+                candidate.mcap_usd, float(self.strategy.get("loop.dead_mcap_usd", 40_000))
+            ):
+                self._drop_watch(candidate, "dead_mcap")
                 continue
             if candidate.pack_role == "vamp":
                 del self.watching[key]
