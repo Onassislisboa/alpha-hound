@@ -311,7 +311,7 @@ def evaluate_gates(
     if not allowed:
         vetoes.append(f"launchpad: {origin_reason}")
 
-    # Age stays on the visor; it is not a buy veto. The watch list is the
+    # Age stays on the visor; it is not a buy veto. The scan list is the
     # selection — paper enters what it already chose.
     if not enr.candidate.created_at_ms:
         abstained.append("age(unmeasured)")

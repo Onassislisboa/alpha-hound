@@ -333,11 +333,11 @@ HTML = """<!doctype html>
   <div><h1>win rate</h1><div class="n" id="winrate">—</div></div>
   <div><h1>avg hold</h1><div class="n" id="avghold">—</div></div>
   <div><h1>holding</h1><div class="n gold" id="holding">—</div></div>
-  <div><h1>watching</h1><div class="n cyan" id="watching">—</div></div>
+  <div><h1>scanning</h1><div class="n cyan" id="watching">—</div></div>
 </header>
 <div id="verdict" class="verdict wait"><span class="tag">WAITING</span><span class="muted" id="verdict-h">sem trades ainda</span></div>
 <nav class="tabs">
-  <button type="button" class="on" data-tab="tab-watch">watch</button>
+  <button type="button" class="on" data-tab="tab-watch">scan</button>
   <button type="button" data-tab="tab-kols">kols</button>
   <button type="button" data-tab="tab-fomo">fomo</button>
   <button type="button" data-tab="tab-pnl">pnl</button>
@@ -350,7 +350,7 @@ HTML = """<!doctype html>
 <main>
   <section>
     <div class="watch-bar">
-      <h1>watching</h1>
+      <h1>scanning</h1>
       <input id="ca-in" placeholder="colar CA" autocomplete="off" spellcheck="false"/>
       <button type="button" id="paste-ca">colar</button>
     </div>

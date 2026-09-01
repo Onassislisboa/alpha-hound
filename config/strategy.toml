@@ -17,7 +17,7 @@ scan_seconds = 2.0
 max_candidate_age_minutes = 180
 # Hard cap on candidates fully enriched per tick, to bound RPC spend. Only
 # candidates that survive the free gates get here, so this is the real budget.
-# Hard cap on candidates fully enriched per tick. 0 = every watching card.
+# Hard cap on candidates fully enriched per tick. 0 = every scan card.
 # The visor shows a note on each coin, so the default is the whole list.
 max_candidates_per_tick = 0
 # How many enrichments run at once. Sequential was one SCAN pill on the visor.
