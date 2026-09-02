@@ -178,8 +178,6 @@ def assemble(
         "holding": len(holds),
         "holding_usd": round(sum(float(h.get("held_usd") or h.get("size_usd") or 0) for h in holds), 2),
         "watching": live.get("watching", len(watch)),
-        "watch_in": int(live.get("watch_in") or 0),
-        "watch_out": int(live.get("watch_out") or 0),
         "best_probability": live.get("best_probability", 0.0),
         "tick": live.get("tick") or {},
         "holds": holds,
@@ -247,12 +245,21 @@ HTML = """<!doctype html>
   .v-organic { color: #5b8cff; } .v-unverified { color: #6a6a6a; }
   tr.pick { cursor: pointer; }
   tr.pick.on td { background: #0c0c0c; }
-  .coin-panel { margin: 0 20px 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; }
+  .coin-panel { margin: 0 0 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; }
   .coin-h { display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; }
   .coin-h .fit { font-size: 28px; font-weight: 800; color: #fff; }
   .coin-h .mcap { font-size: 22px; font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; }
   .coin-h .age { font-size: 15px; font-weight: 700; color: #ffd24a; }
-  .coin-panel ul { margin: 8px 0 0; padding-left: 16px; color: var(--text); }
+  .coin-panel ul { margin: 8px 0 0; padding-left: 16px; color: var(--text); word-break: break-word; }
+  .coin-ca { word-break: break-all; color: var(--hi); font-size: 12px; }
+  .coin-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px 16px; margin: 12px 0; }
+  .coin-stats b { display: block; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .coin-stats span { font-size: 15px; color: #fff; font-variant-numeric: tabular-nums; word-break: break-word; }
+  .buy-box { margin: 12px 0; padding: 12px; border: 1px solid #333; border-radius: 8px; background: #0a0a0a; }
+  .buy-box h2 { margin: 0 0 8px; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: #ffd24a; }
+  .cat-list { display: grid; gap: 6px; margin: 8px 0; }
+  .cat-list > div { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+  .coin-panel .wrap { white-space: normal; overflow: visible; }
   button.copy { font: inherit; font-size: 10px; background: #111; color: #c8c8c8; border: 1px solid #333;
                 padding: 2px 8px; border-radius: 4px; cursor: pointer; letter-spacing: .04em; }
   button.copy:hover { color: #fff; border-color: #555; }
@@ -354,8 +361,8 @@ HTML = """<!doctype html>
       <input id="ca-in" placeholder="colar CA" autocomplete="off" spellcheck="false"/>
       <button type="button" id="paste-ca">colar</button>
     </div>
-    <div id="watch" class="watch-grid"></div>
     <div id="coin" class="coin-panel" hidden></div>
+    <div id="watch" class="watch-grid"></div>
   </section>
   <section>
     <h1>holds</h1>
@@ -407,12 +414,32 @@ HTML = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const usd = n => (n<0?'−':'') + '$' + Math.abs(n).toFixed(2);
+const usdFull = n => {
+  n = Number(n)||0;
+  const abs = Math.abs(n);
+  const s = abs >= 1000
+    ? Math.round(abs).toLocaleString('en-US')
+    : abs.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 6});
+  return (n<0?'−':'') + '$' + s;
+};
+const numFull = n => Math.round(Number(n)||0).toLocaleString('en-US');
+const pctFull = n => {
+  n = Number(n)||0;
+  return (n>=0?'+':'') + (n*100).toFixed(2) + '%';
+};
+const esc = s => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
 const kM = n => {
   n = Math.abs(Number(n)||0);
   if (n >= 1e6) return (Math.round(n/1e5)/10) + 'M';
   if (n >= 1e4) return Math.round(n/1000) + 'k';
   if (n >= 1e3) return (Math.round(n/100)/10) + 'k';
   return String(Math.round(n));
+};
+const mcapTxt = n => {
+  n = Math.abs(Number(n)||0);
+  if (n >= 1e6) return '$' + (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return '$' + (n/1e3).toFixed(1) + 'k';
+  return '$' + Math.round(n);
 };
 const pct = n => (n>=0?'+':'') + Math.round(n*100) + '%';
 const cls = n => n>0?'up':n<0?'dn':'';
@@ -425,9 +452,11 @@ const ageTxt = m => {
   }
   return Math.round(m) + ' min';
 };
-const certHtml = c => c==='ok' ? '<span class="cert-ok">CERT OK</span>'
-  : c==='no' ? '<span class="cert-no">CERT NO</span>'
-  : '<span class="cert-q">CERT —</span>';
+const certHtml = c => {
+  const k = c==='ok'?'cert-ok':c==='no'?'cert-no':'cert-q';
+  const t = c==='ok'?'CERT OK':c==='no'?'CERT NO':'CERT —';
+  return '<span class="'+k+'" data-f="cert">'+t+'</span>';
+};
 function xHandle(h) {
   h = String(h||'').replace(/^@/,'').trim();
   if (!/^[A-Za-z0-9_]{1,15}$/.test(h) || /^\\d+$/.test(h)) return '';
@@ -446,8 +475,8 @@ function twLine(tw) {
 }
 function twBlock(tw) {
   if (!tw) return '';
-  const posts = (tw.posts||[]).map(p => '<li>@'+p.handle+' · '+kM(p.followers)+' · '
-    +(p.age_min==null?'':ageTxt(p.age_min)+' · ')+(p.text||'')+'</li>').join('');
+  const posts = (tw.posts||[]).map(p => '<li>@'+esc(p.handle)+' · '+numFull(p.followers)+' followers · '
+    +(p.age_min==null?'':ageTxt(p.age_min)+' · ')+esc(p.text||'')+'</li>').join('');
   return twLine(tw) + (posts ? '<ul>'+posts+'</ul>' : '');
 }
 function dexLine(w) {
@@ -456,11 +485,12 @@ function dexLine(w) {
     : '<div class="meta"><span class="dex-no" data-f="dex">NOT DEX</span></div>';
 }
 function rubricLine(r) {
-  if (!r || r.total == null) return '';
-  const tone = r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
-  const row = (k, v) => '<b>'+k+'<em><i data-k="'+k+'" style="width:'+Math.max(0,Math.min(100,Math.round((v/10)*100)))+'%"></i></em></b>';
+  r = r || {};
+  const total = r.total == null ? '—' : r.total;
+  const tone = (r.total||0) >= 7 ? 'hi' : (r.total||0) >= 5.5 ? 'mid' : 'lo';
+  const row = (k, v) => '<b>'+k+'<em><i data-k="'+k+'" style="width:'+Math.max(0,Math.min(100,Math.round(((v||0)/10)*100)))+'%"></i></em></b>';
   return '<div class="score score-'+tone+'" data-f="score">'
-    + '<span class="score-n" data-f="score-n">'+r.total+'</span>'
+    + '<span class="score-n" data-f="score-n">'+total+'</span>'
     + '<div class="score-bars">'
     + row('D', r.dist)+row('C', r.crowd)+row('F', r.flow)+row('G', r.chart)+row('N', r.narrative)
     + '</div></div>';
@@ -479,66 +509,98 @@ let uniReady = false;
 let inflight = false;
 
 function watchKey(w) { return w.chain+':'+w.address; }
-function watchSig(w) {
-  return [w.symbol, w.call, w.cert, w.label, w.role,
-    (w.kols||[]).join(','), (w.fomo||[]).join(','), w.tw && w.tw.official, w.rubric ? 1 : 0, w.whale_n==null?0:1].join('|');
-}
 function watchBody(w) {
   const call = w.call || 'scan';
   const skipHint = (call==='skip' && w.label==='unverified')
     ? 'holders da Solana nao medidos. Precisa Helius/RPC.'
     : '';
   const pill = w.label
-    ? '<span class="pill v-'+w.label+'"'+(skipHint?' title="'+skipHint+'"':'')+'>'+call.toUpperCase()+' '+w.label+'</span>'
-    : '<span class="pill st-'+call+'">'+call.toUpperCase()+'</span>';
-  const whales = w.whale_n == null
-    ? ''
-    : '<div class="meta" data-f="whales">whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)+'</div>';
+    ? '<span class="pill v-'+w.label+'" data-f="pill"'+(skipHint?' title="'+skipHint+'"':'')+'>'+call.toUpperCase()+' '+w.label+'</span>'
+    : '<span class="pill st-'+call+'" data-f="pill">'+call.toUpperCase()+'</span>';
+  const whales = '<div class="meta" data-f="whales">'
+    + (w.whale_n == null ? '' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)))
+    + '</div>';
   const kols = (w.kols && w.kols.length) ? w.kols.join(', ') : '—';
   const fomo = (w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—';
-  return '<div class="wcard-h"><span class="sym">'+(w.symbol || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
+  return '<div class="wcard-h"><span class="sym" data-f="sym">'+(w.symbol || caHead(w.address))+'</span>'+copyBtn(w.address)+'</div>'
     + '<div class="wcard-h"><span class="chain">'+chainShort(w.chain)+'</span><span class="age" data-f="age">'+ageTxt(w.age_min)+'</span></div>'
-    + '<div class="mcap" data-f="mcap">$'+kM(w.mcap)+'</div>'
+    + '<div class="mcap" data-f="mcap">'+mcapTxt(w.mcap)+'</div>'
     + certHtml(w.cert)+' '+pill+' '+role(w.role)
     + whales
-    + '<div class="kols">kols '+kols+'</div>'
-    + '<div class="kols">fomo '+fomo+'</div>'
+    + '<div class="kols" data-f="kols">kols '+kols+'</div>'
+    + '<div class="kols" data-f="fomo">fomo '+fomo+'</div>'
     + dexLine(w)
-    + rubricLine(w.rubric)
-    + (w.why && w.why !== 'ok' ? '<div class="meta" data-f="why">'+w.why+'</div>' : '')
-    + twLine(w.tw)
+    + rubricLine(w.rubric || {})
+    + '<div class="meta" data-f="why">'+(w.why && w.why !== 'ok' ? w.why : '')+'</div>'
+    + '<div class="meta" data-f="pev">'+(w.p != null ? ('p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3)) : '')+'</div>'
+    + '<div data-f="tw" data-h="'+esc(xHandle(w.tw && w.tw.official)||'')+'">'+twLine(w.tw)+'</div>'
     + '<div data-f="ret" class="'+cls(w.ret_5m)+'">'+pct(w.ret_5m||0)+' · vol '+kM(w.vol5m)+'</div>';
 }
+function setNode(n, t) {
+  if (!n) return;
+  t = String(t);
+  if (n.childNodes.length === 1 && n.firstChild.nodeType === 3) {
+    if (n.firstChild.nodeValue !== t) n.firstChild.nodeValue = t;
+    return;
+  }
+  if (n.textContent !== t) n.textContent = t;
+}
 function fillLive(el, w) {
-  const set = (f, t) => {
-    const n = el.querySelector('[data-f="'+f+'"]');
-    if (n && n.textContent !== t) n.textContent = t;
-  };
-  set('mcap', '$'+kM(w.mcap));
+  const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
+  set('mcap', mcapTxt(w.mcap));
   set('age', ageTxt(w.age_min));
+  set('sym', w.symbol || caHead(w.address));
+  set('kols', 'kols '+((w.kols && w.kols.length) ? w.kols.join(', ') : '—'));
+  set('fomo', 'fomo '+((w.fomo && w.fomo.length) ? w.fomo.join(', ') : '—'));
+  set('why', (w.why && w.why !== 'ok') ? w.why : '');
+  set('whales', w.whale_n == null ? '' : ('whales '+w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0)));
+  const cert = el.querySelector('[data-f="cert"]');
+  if (cert) {
+    const ck = w.cert==='ok'?'cert-ok':w.cert==='no'?'cert-no':'cert-q';
+    if (cert.className !== ck) cert.className = ck;
+    setNode(cert, w.cert==='ok'?'CERT OK':w.cert==='no'?'CERT NO':'CERT —');
+  }
+  const pill = el.querySelector('[data-f="pill"]');
+  if (pill) {
+    const call = w.call || 'scan';
+    const pk = 'pill ' + (w.label ? ('v-'+w.label) : ('st-'+call));
+    if (pill.className !== pk) pill.className = pk;
+    setNode(pill, w.label ? (call.toUpperCase()+' '+w.label) : call.toUpperCase());
+  }
+  const tw = el.querySelector('[data-f="tw"]');
+  if (tw) {
+    const h = xHandle(w.tw && w.tw.official);
+    if (tw.dataset.h !== String(h||'')) {
+      tw.dataset.h = h||'';
+      tw.innerHTML = twLine(w.tw);
+    }
+  }
   const dex = el.querySelector('[data-f="dex"]');
   if (dex) {
-    dex.className = w.dex_paid ? 'dex-paid' : 'dex-no';
-    const t = w.dex_paid ? 'DEX PAID' : 'NOT DEX';
-    if (dex.textContent !== t) dex.textContent = t;
+    const dk = w.dex_paid ? 'dex-paid' : 'dex-no';
+    if (dex.className !== dk) dex.className = dk;
+    setNode(dex, w.dex_paid ? 'DEX PAID' : 'NOT DEX');
   }
-  const r = w.rubric;
+  const r = w.rubric || {};
   const score = el.querySelector('[data-f="score"]');
-  if (r && r.total != null && score) {
-    const tone = r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
-    score.className = 'score score-'+tone;
+  if (r.total != null && score) {
+    const tone = 'score score-' + (r.total >= 7 ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo');
+    if (score.className !== tone) score.className = tone;
     set('score-n', String(r.total));
     const wmap = {D:r.dist, C:r.crowd, F:r.flow, G:r.chart, N:r.narrative};
     score.querySelectorAll('i[data-k]').forEach(i => {
-      const pct = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
-      i.style.width = pct+'%';
+      const pctw = Math.max(0, Math.min(100, Math.round(((wmap[i.dataset.k]||0)/10)*100)));
+      if (i.style.width !== pctw+'%') i.style.width = pctw+'%';
     });
   }
   const ret = el.querySelector('[data-f="ret"]');
   if (ret) {
-    ret.className = cls(w.ret_5m);
-    const t = pct(w.ret_5m||0)+' · vol '+kM(w.vol5m);
-    if (ret.textContent !== t) ret.textContent = t;
+    const rk = cls(w.ret_5m);
+    if (ret.className !== rk) ret.className = rk;
+    setNode(ret, pct(w.ret_5m||0)+' · vol '+kM(w.vol5m));
+  }
+  if (w.p != null) {
+    set('pev', 'p '+Number(w.p).toFixed(3)+' · EV '+(Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(3));
   }
 }
 
@@ -546,73 +608,148 @@ function paintWatch(list, running) {
   const box = $('watch');
   if (!box) return;
   if (!list.length) {
-    box.innerHTML = '<div class="muted">'+(running?'scanning…':'start the bot')+'</div>';
+    const msg = running ? 'scanning…' : 'start the bot';
+    if (!box.querySelector('.wcard')) {
+      const cur = box.querySelector('.muted');
+      if (!cur || cur.textContent !== msg) box.innerHTML = '<div class="muted">'+msg+'</div>';
+    }
     return;
   }
   if (box.querySelector('.muted') && !box.querySelector('.wcard')) box.innerHTML = '';
   const have = new Map([...box.querySelectorAll('.wcard')].map(el => [el.dataset.pick, el]));
   const keep = new Set();
-  list.forEach((w, i) => {
+  list.forEach(w => {
     const key = watchKey(w);
     keep.add(key);
     let el = have.get(key);
-    const sig = watchSig(w);
     if (!el) {
       el = document.createElement('div');
       el.className = 'wcard pick';
       el.dataset.pick = key;
       el.innerHTML = watchBody(w);
-      el.dataset.sig = sig;
       box.appendChild(el);
-    } else if (el.dataset.sig !== sig) {
-      el.innerHTML = watchBody(w);
-      el.dataset.sig = sig;
-    } else {
-      fillLive(el, w);
     }
+    fillLive(el, w);
   });
   have.forEach((el, key) => { if (!keep.has(key)) el.remove(); });
 }
 
-function paintCoin() {
+function fillCoin(el, w) {
+  const set = (f, t) => setNode(el.querySelector('[data-f="'+f+'"]'), t);
+  const r = w.rubric || {};
+  set('mcap', usdFull(w.mcap));
+  set('liq', usdFull(w.liq));
+  set('vol5m', usdFull(w.vol5m));
+  set('ret5m', pctFull(w.ret_5m));
+  set('age', (Number(w.age_min)||0).toFixed(2)+' min');
+  set('holders', w.holders==null?'—':numFull(w.holders));
+  set('rt', w.rt==null?'—':pctFull(w.rt));
+  set('c-score', r.total==null?'—':String(r.total));
+  set('cat-dist', (r.dist==null?'—':r.dist)+' / 10');
+  set('cat-crowd', (r.crowd==null?'—':r.crowd)+' / 10');
+  set('cat-flow', (r.flow==null?'—':r.flow)+' / 10');
+  set('cat-chart', (r.chart==null?'—':r.chart)+' / 10');
+  set('cat-narr', (r.narrative==null?'—':r.narrative)+' / 10');
+  const minP = w.min_p == null ? '—' : Number(w.min_p).toFixed(4);
+  const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
+  set('pwin', (w.p == null ? '—' : Number(w.p).toFixed(4))+'  (piso '+minP+')');
+  set('ev', (w.ev == null ? '—' : ((Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(4)))+'  (piso '+minEv+')');
+  set('why', w.explain || w.why || '');
+  set('whales', w.whale_n==null?'—':(numFull(w.whale_n)+' · '+pctFull(w.whale_pct)+' · '+usdFull(w.whale_usd)));
+  set('kols', (w.kols&&w.kols.length) ? w.kols.join(', ') : '—');
+  set('fomo', (w.fomo&&w.fomo.length) ? w.fomo.join(', ') : '—');
+  const dex = el.querySelector('[data-f="dex"]');
+  if (dex) {
+    dex.className = w.dex_paid ? 'dex-paid' : 'dex-no';
+    const t = w.dex_paid ? 'DEX PAID' : 'NOT DEX';
+    if (dex.textContent !== t) dex.textContent = t;
+  }
+}
+
+function paintCoin(opts) {
   const box = $('coin');
   if (!box) return;
   const w = lastWatch.find(x => watchKey(x) === picked);
   document.querySelectorAll('#watch .pick').forEach(r => r.classList.toggle('on', r.dataset.pick === picked));
   if (!w) { box.hidden = true; box.innerHTML = ''; box.dataset.pick = ''; return; }
   box.hidden = false;
-  if (box.dataset.pick === picked && box.querySelector('[data-f=mcap]')) {
-    fillLive(box, w);
-    const why = box.querySelector('[data-f=why]');
-    if (why && why.textContent !== (w.why||'')) why.textContent = w.why||'';
+  const struct = [picked, w.call, w.cert, w.label, w.address].join('|');
+  if (box.dataset.pick === picked && box.dataset.struct === struct && box.querySelector('[data-f=mcap]') && !(opts && opts.scroll)) {
+    fillCoin(box, w);
     return;
   }
+  box.dataset.struct = struct;
   box.dataset.pick = picked;
   const call = (w.call || 'scan').toUpperCase();
+  const r = w.rubric || {};
+  const stat = (k, f, v) => '<div><b>'+k+'</b><span data-f="'+f+'">'+v+'</span></div>';
+  const pTxt = w.p == null ? '—' : Number(w.p).toFixed(4);
+  const evTxt = w.ev == null ? '—' : ((Number(w.ev)>=0?'+':'')+Number(w.ev).toFixed(4));
+  const minP = w.min_p == null ? '—' : Number(w.min_p).toFixed(4);
+  const minEv = w.min_ev == null ? '—' : Number(w.min_ev).toFixed(4);
+  const minR = w.min_rubric == null ? '—' : String(w.min_rubric);
+  const tone = r.total >= (w.min_rubric||7) ? 'hi' : r.total >= 5.5 ? 'mid' : 'lo';
+  const wallets = (w.wallets||[]).join(', ') || '—';
+  const kols = (w.kols&&w.kols.length) ? w.kols.join(', ') : '—';
+  const fomo = (w.fomo&&w.fomo.length) ? w.fomo.join(', ') : '—';
+  const vetoes = (w.vetoes&&w.vetoes.length) ? w.vetoes : (w.why ? [w.why] : []);
   box.innerHTML = '<div class="coin-h">'
-    + '<div class="sym">'+(w.symbol||'')+'</div>'
-    + '<div class="chain">'+chainShort(w.chain)+'</div>'
-    + '<div class="age" data-f="age">'+ageTxt(w.age_min)+'</div>'
-    + '<div class="mcap" data-f="mcap">$'+kM(w.mcap)+'</div>'
-    + '<div class="fit v-'+(w.label||'')+'">'+(w.fit||0)+'</div>'
-    + '<div class="v-'+(w.label||'')+'">'+(w.label||call)+'</div>'
+    + '<div class="sym">'+(esc(w.symbol)||'—')+'</div>'
+    + '<div class="chain">'+esc(w.chain)+'</div>'
     + certHtml(w.cert)
-    + '<span class="pill st-'+(w.call||'scan')+'">'+call+'</span></div>'
-    + '<p class="muted">whales '+(w.whale_n==null?'—':w.whale_n+' · '+Math.round((w.whale_pct||0)*100)+'% · $'+kM(w.whale_usd||0))
-    + ' · kols '+((w.kols&&w.kols.length)?w.kols.join(', '):'—')
-    + ' · fomo '+((w.fomo&&w.fomo.length)?w.fomo.join(', '):'—')+'</p>'
+    + '<span class="pill st-'+(w.call||'scan')+'">'+call+'</span>'
+    + (w.label ? '<span class="pill v-'+esc(w.label)+'">'+esc(w.label)+(w.fit!=null?' · fit '+w.fit:'')+'</span>' : '')
+    + role(w.role)
+    + '</div>'
+    + (w.name ? '<p>'+esc(w.name)+'</p>' : '')
+    + '<p class="coin-ca">'+esc(w.address)+' '+copyBtn(w.address)+'</p>'
+    + '<div class="coin-stats">'
+    + stat('mcap', 'mcap', usdFull(w.mcap))
+    + stat('liquidity', 'liq', usdFull(w.liq))
+    + stat('vol 5m', 'vol5m', usdFull(w.vol5m))
+    + stat('ret 5m', 'ret5m', pctFull(w.ret_5m))
+    + stat('age', 'age', (Number(w.age_min)||0).toFixed(2)+' min')
+    + stat('holders', 'holders', w.holders==null?'—':numFull(w.holders))
+    + stat('round trip', 'rt', w.rt==null?'—':pctFull(w.rt))
+    + stat('dex', 'dexname', esc(w.dex||'—'))
+    + stat('source', 'source', esc(w.source||'—'))
+    + stat('dex paid', 'dexpaid', w.dex_paid ? 'yes' : 'no')
+    + '</div>'
+    + '<div class="buy-box score-'+tone+'">'
+    + '<h2>nota desta moeda</h2>'
+    + '<p>Régua igual pra todas; os inputs (chart, crowd, chain, narrativa) são desta CA. WAITING no topo é PnL da conta, não nota.</p>'
+    + '<div class="coin-h"><span class="score-n" data-f="c-score">'+(r.total==null?'—':r.total)+'</span>'
+    + '<span class="muted">rubric / '+minR+' pra passar o piso</span></div>'
+    + '<div class="cat-list">'
+    + '<div><span>distribution</span><span data-f="cat-dist">'+(r.dist==null?'—':r.dist)+' / 10</span></div>'
+    + '<div><span>crowd</span><span data-f="cat-crowd">'+(r.crowd==null?'—':r.crowd)+' / 10</span></div>'
+    + '<div><span>flow</span><span data-f="cat-flow">'+(r.flow==null?'—':r.flow)+' / 10</span></div>'
+    + '<div><span>chart</span><span data-f="cat-chart">'+(r.chart==null?'—':r.chart)+' / 10</span></div>'
+    + '<div><span>narrative</span><span data-f="cat-narr">'+(r.narrative==null?'—':r.narrative)+' / 10</span></div>'
+    + '</div>'
+    + '<div class="coin-stats">'
+    + stat('p (win)', 'pwin', pTxt+'  (piso '+minP+')')
+    + stat('EV', 'ev', evTxt+'  (piso '+minEv+')')
+    + stat('call', 'call', call)
+    + '</div>'
+    + '<p data-f="why">'+esc(w.explain || w.why || '')+'</p>'
+    + (vetoes.length ? '<ul>'+vetoes.map(s => '<li>'+esc(s)+'</li>').join('')+'</ul>' : '')
+    + '</div>'
+    + '<p class="wrap">whales <span data-f="whales">'+(w.whale_n==null?'—':(numFull(w.whale_n)+' · '+pctFull(w.whale_pct)+' · '+usdFull(w.whale_usd)))+'</span></p>'
+    + '<p class="wrap">kols <span data-f="kols">'+esc(kols)+'</span></p>'
+    + '<p class="wrap">fomo <span data-f="fomo">'+esc(fomo)+'</span></p>'
+    + '<p class="wrap">wallets '+esc(wallets)+'</p>'
     + dexLine(w)
-    + rubricLine(w.rubric)
     + twBlock(w.tw)
-    + '<p class="muted" data-f="why">'+(w.why||'')+'</p>'
-    + '<ul>'+(w.signals||[]).map(s => '<li>'+s+'</li>').join('')+'</ul>'
-    + '<p class="muted">Organic não é compra. Bundled = skip. Cabaled na Solana = skip; na Hood o EV decide.</p>';
+    + ((w.signals||[]).length ? '<ul>'+(w.signals||[]).map(s => '<li>'+esc(s)+'</li>').join('')+'</ul>' : '')
+    + '<p class="muted">Organic não é compra. Bundled = skip. Cabaled na Solana = skip; na Hood o EV desta moeda decide.</p>';
+  if (opts && opts.scroll) box.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
 function setText(id, text, extra) {
   const el = $(id);
   if (!el) return;
-  if (el.textContent !== text) el.textContent = text;
+  setNode(el, text);
   if (extra != null) el.className = extra;
 }
 
@@ -680,7 +817,7 @@ document.addEventListener('click', e => {
   const pick = e.target.closest('[data-pick]');
   if (pick && !e.target.closest('[data-copy]') && !e.target.closest('a')) {
     picked = pick.dataset.pick;
-    paintCoin();
+    paintCoin({scroll: true});
     return;
   }
   const rmFomo = e.target.closest('[data-fomo-rm]');
@@ -824,9 +961,7 @@ async function tick() {
     'n ' + (d.win_rate == null ? '' : d.win_rate >= 0.5 ? 'up' : 'dn'));
   setText('avghold', d.avg_hold_min == null ? '—' : mins(d.avg_hold_min), 'n');
   setText('holding', (d.holding||0) + (d.holding ? '  '+usd(d.holding_usd) : ''), 'n gold');
-  const flow = (d.watch_in||d.watch_out)
-    ? '  +'+ (d.watch_in||0) + ' −' + (d.watch_out||0) : '';
-  setText('watching', String(d.watching||0) + flow, 'n cyan');
+  setText('watching', String(d.watching||0), 'n cyan');
   paintVerdict(d);
   if (!uniReady) {
     $('universe').innerHTML = (d.universe.chains||[]).map(chainCard).join('');

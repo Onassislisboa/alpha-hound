@@ -47,7 +47,9 @@ class PositionManager:
             position.peak_price = price
         if price < position.trough_price:
             position.trough_price = price
-        if liquidity_usd > position.peak_liquidity_usd:
+        if liquidity_usd > 0 and (
+            position.peak_liquidity_usd <= 0 or liquidity_usd > position.peak_liquidity_usd
+        ):
             position.peak_liquidity_usd = liquidity_usd
 
     def evaluate(self, position: Position, price: float, liquidity_usd: float) -> list[ExitOrder]:

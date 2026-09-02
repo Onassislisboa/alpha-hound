@@ -49,7 +49,7 @@ from .preview import write_preview
 from .providers import Birdeye, Bubblemaps, Dexscreener, FomoGraph, Helius, Twitter, twitter_handle
 from .risk import RiskEngine
 from .rubric import grade
-from .scoring import Model, Scorer, hold_cut
+from .scoring import Model, Scorer, hold_cut, patience_only, watch_call
 from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
@@ -58,7 +58,7 @@ from .settings import (
     load_strategy,
     load_terminals,
 )
-from .signals import Enricher
+from .signals import Enricher, Enrichment
 from .signals.pack import apply_tags, dump_beta_keys
 from .signals.solana import SolanaReader
 from .signals.terminals import TerminalRegistry
@@ -102,8 +102,7 @@ class Engine:
         self.http = Http()
         self.dex = Dexscreener(
             self.http,
-            cache_seconds=0.5
-            * float(self.strategy.get("loop.quote_seconds", 1.0)),
+            cache_seconds=max(0.3, float(self.strategy.get("loop.quote_seconds", 1.0))),
         )
         self.helius = Helius(self.http, settings.helius_api_key)
         self.birdeye = Birdeye(self.http, settings.birdeye_api_key)
@@ -240,7 +239,7 @@ class Engine:
 
     async def _quote_loop(self) -> None:
         async def body() -> None:
-            await self._refresh_watch_quotes()
+            await self._refresh_watch_quotes(probe_paid=False)
             self._prune_watching()
             self._write_preview()
 
@@ -361,6 +360,7 @@ class Engine:
                         "dex_paid": c.dex_paid,
                         "dex_photo": c.dex_photo,
                         "dex_aligned": c.dex_aligned,
+                        "liq": round(c.liquidity_usd),
                         **(self._reads.get(c.key) or {"call": "scan"}),
                     }
                     for c in sorted(
@@ -673,15 +673,83 @@ class Engine:
 
         scored = await asyncio.gather(*(guarded(c) for c in ranked), return_exceptions=True)
         halted, _reason = self.risk.halted()
+        picks: list[tuple[Decision, list[str], list[str]]] = []
         for item in scored:
             if isinstance(item, Exception):
                 log.debug("score failed", extra={"error": str(item)})
                 continue
-            if not item or halted:
-                continue
-            decision, buyers, sponsors = item
-            decision_id = self.store.record_decision(decision)
-            await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
+            if item:
+                picks.append(item)
+        if halted or not picks:
+            return
+        picks.sort(
+            key=lambda x: (x[0].score.expected_value, x[0].score.probability),
+            reverse=True,
+        )
+        decision, buyers, sponsors = picks[0]
+        decision_id = self.store.record_decision(decision)
+        await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
+
+    def _buy_floors(self) -> dict[str, float]:
+        return {
+            "min_p": round(
+                self.store.param(
+                    "scoring.min_probability",
+                    float(self.strategy.get("scoring.min_probability", 0.56)),
+                ),
+                4,
+            ),
+            "min_ev": round(
+                self.store.param(
+                    "scoring.min_expected_value",
+                    float(self.strategy.get("scoring.min_expected_value", 0.035)),
+                ),
+                4,
+            ),
+            "min_rubric": round(float(self.strategy.get("scoring.min_rubric", 7.0)), 1),
+        }
+
+    def _score_read(
+        self,
+        candidate: Candidate,
+        score: Score,
+        call: str,
+        why: str,
+        enrichment: Enrichment | None,
+    ) -> dict:
+        mint = None if enrichment is None else enrichment.mint
+        crowd = {} if enrichment is None else (enrichment.crowd or {})
+        tw = {} if enrichment is None else (enrichment.twitter or {})
+        holders = 0
+        rt = None
+        if enrichment is not None:
+            holders = int(enrichment.features.holder_count or 0)
+            rt = round(float(enrichment.features.round_trip_cost or 0.0), 4)
+        crowd_ui = {
+            k: crowd[k]
+            for k in ("kols", "fomo", "whale_n", "whale_pct", "whale_usd")
+            if k in crowd
+        }
+        return {
+            **(score.dist or {}),
+            **crowd_ui,
+            "call": call,
+            "why": why,
+            "p": round(score.probability, 4),
+            "ev": round(score.expected_value, 4),
+            **self._buy_floors(),
+            "holders": holders,
+            "rt": rt,
+            "vetoes": list(score.veto_reasons),
+            "explain": self.scorer.explain(score) if score.probability else why,
+            "cert": security_cert(
+                (score.dist or {}).get("label") or "",
+                score.veto_reasons,
+                mint.authorities_revoked if mint is not None else None,
+            ),
+            "tw": tw,
+            "rubric": score.rubric or {},
+        }
 
     async def _score_one(
         self, candidate: Candidate, probe_size: float
@@ -706,20 +774,24 @@ class Engine:
             ]
             if free_vetoes and candidate.source != "inspect":
                 self._tick_counts[f"free_veto:{free_vetoes[0].split(':')[0]}"] += 1
+                cheap_score = Score(
+                    probability=0.0,
+                    expected_value=0.0,
+                    veto_reasons=free_vetoes,
+                    rubric=grade(cheap, self.store, self.strategy).as_visor(),
+                )
                 self._record(
                     candidate,
                     cheap.features,
-                    Score(probability=0.0, expected_value=0.0, veto_reasons=free_vetoes),
+                    cheap_score,
                     Action.REJECT_GATE,
                     0.0,
                     free_vetoes[0],
                     cheap.unknown,
                 )
-                self._paint_watch(
-                    candidate,
-                    call="skip",
-                    why=free_vetoes[0],
-                    rubric=grade(cheap, self.store, self.strategy).as_visor(),
+                call = "wait" if patience_only(free_vetoes) else "skip"
+                self._reads[candidate.key] = self._score_read(
+                    candidate, cheap_score, call, free_vetoes[0], cheap
                 )
                 painted = True
                 return None
@@ -736,22 +808,10 @@ class Engine:
             score = self.scorer.score(enrichment)
             self._best_probability = max(self._best_probability, score.probability)
             ok, why = self.scorer.passes(score)
-            call = "skip" if score.vetoed else ("trade" if ok else "wait")
-            mint = enrichment.mint
-            self._reads[candidate.key] = {
-                **(score.dist or {}),
-                **(enrichment.crowd or {}),
-                "call": call,
-                "holders": int(enrichment.features.holder_count or 0),
-                "why": why,
-                "cert": security_cert(
-                    (score.dist or {}).get("label") or "",
-                    score.veto_reasons,
-                    mint.authorities_revoked if mint is not None else None,
-                ),
-                "tw": enrichment.twitter or {},
-                "rubric": score.rubric or {},
-            }
+            call = watch_call(vetoed=score.vetoed, ok=ok, reasons=score.veto_reasons)
+            self._reads[candidate.key] = self._score_read(
+                candidate, score, call, why, enrichment
+            )
             painted = True
             if not ok:
                 action = Action.REJECT_GATE if score.vetoed else Action.REJECT_SCORE
@@ -939,7 +999,7 @@ class Engine:
         )
 
     # -- housekeeping ------------------------------------------------------
-    async def _refresh_watch_quotes(self) -> None:
+    async def _refresh_watch_quotes(self, *, probe_paid: bool = True) -> None:
         """Re-price everything on the visor. Discovery only re-emits a mint
         about once a minute, so without this the mcap/vol/5m freeze at first sight.
         """
@@ -975,18 +1035,19 @@ class Engine:
                 read = self._reads.get(candidate.key)
                 if read is not None:
                     read["call"] = "scan"
-        for candidate in unpaid[:8]:
-            try:
-                paid = await self.dex.token_is_paid(candidate.chain, candidate.address)
-            except Exception:  # noqa: BLE001
-                continue
-            if not paid:
-                continue
-            candidate.dex_paid = True
-            candidate.last_scored_ms = 0
-            read = self._reads.get(candidate.key)
-            if read is not None:
-                read["call"] = "scan"
+        if probe_paid:
+            for candidate in unpaid[:8]:
+                try:
+                    paid = await self.dex.token_is_paid(candidate.chain, candidate.address)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not paid:
+                    continue
+                candidate.dex_paid = True
+                candidate.last_scored_ms = 0
+                read = self._reads.get(candidate.key)
+                if read is not None:
+                    read["call"] = "scan"
 
     def _retag(self) -> dict:
         by_key = {c.key: c for c in self.watching.values()}
@@ -1113,6 +1174,9 @@ class Engine:
                 )
                 self.positions[candidate.key] = position
                 self.watching[candidate.key] = candidate
+                # Drain vs a peak from a previous process is a false rug: the
+                # bot was off, liq moved, first tick looks like LP pulling.
+                position.peak_liquidity_usd = 0.0
             except (KeyError, TypeError, ValueError) as exc:
                 log.error("skipping unreadable position", extra={"error": str(exc)})
         if self.positions:

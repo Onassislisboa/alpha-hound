@@ -1,8 +1,8 @@
-"""Command line interface.
+"""FirstKill CLI (`python -m alphahound`).
 
-`alphahound run` is the bot. Everything else exists to answer a question you
-will have at 2am: what did it decide, why, what did that cost, and what has it
-changed about itself since.
+`run` is the bot. Everything else exists to answer a question you will have
+at 2am: what did it decide, why, what did that cost, and what has it changed
+about itself since.
 """
 
 from __future__ import annotations
@@ -83,6 +83,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     model = Model.load(store)
     print(f"  weights version   {model.version} ({'learned' if model.version else 'priors'})")
+    print(
+        f"  open slots        {int(strategy.get('risk.max_concurrent_positions', 1))}"
+        f" concurrent / {int(strategy.get('risk.max_positions_per_chain', 1))} per chain"
+    )
 
     engaged = store.get_kv("kill_switch") == "1"
     print(f"  kill switch       {'ENGAGED - ' + store.get_kv('kill_switch_reason') if engaged else 'clear'}")

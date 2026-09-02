@@ -277,6 +277,16 @@ class Model:
 # ---------------------------------------------------------------------------
 
 
+def _live_x(tw: dict) -> bool:
+    h = str(tw.get("official") or "").replace("@", "").strip()
+    if len(h) < 2 or h.isdigit():
+        return False
+    age = tw.get("official_age_min")
+    if age is not None and float(age) > 360:
+        return False
+    return True
+
+
 @dataclass(slots=True)
 class Gate:
     name: str
@@ -323,9 +333,10 @@ def evaluate_gates(
     if min_vol > 0 and vol_seen and enr.candidate.volume_5m_usd < min_vol:
         vetoes.append(f"volume: {enr.candidate.volume_5m_usd:.0f} < {min_vol:.0f} (5m)")
     min_tw = p("min_twitter_mentions", 0.0)
+    tw = getattr(enr, "twitter", None) or {}
+    live_x = _live_x(tw)
     if min_tw > 0 and "twitter_mentions" not in unknown and f.twitter_mentions < min_tw:
         vetoes.append(f"twitter: {f.twitter_mentions:.0f} mentions (want {min_tw:.0f})")
-    tw = getattr(enr, "twitter", None) or {}
     if tw.get("official") and tw.get("official_age_min") is not None:
         off_age = float(tw["official_age_min"])
         if off_age > 360:
@@ -340,7 +351,10 @@ def evaluate_gates(
     if copy_mcap > 0 and enr.candidate.mcap_usd > copy_mcap and ripped:
         vetoes.append("priced: mcap already past copy window")
     max_chase = float(pb_section(strategy, chain).get("max_chase_ret_5m", 0) or 0)
-    if max_chase > 0 and enr.candidate.ret_5m > max_chase:
+    thesis = live_x or (
+        "copy_signal" not in unknown and f.copy_signal >= 1.0
+    ) or ("twitter_inst" not in unknown and f.twitter_inst >= 0.5)
+    if max_chase > 0 and enr.candidate.ret_5m > max_chase and not thesis:
         vetoes.append("chase: 5m ripped, wait dip")
     max_cluster = p("max_cluster_pct", 0.0)
     if max_cluster > 0 and "cluster_pct" not in unknown and f.cluster_pct > max_cluster:
@@ -489,6 +503,25 @@ def evaluate_gates(
         ):
             vetoes.append(extra)
     return vetoes, abstained
+
+
+# Chase/priced = don't buy the rip. Round-trip = don't pay a fat spread.
+# Stay on the visor and re-score until the print is actually buyable.
+PATIENCE_PREFIXES = ("chase:", "priced:", "round_trip_cost:", "twitter:")
+
+
+def patience_only(reasons: list[str]) -> bool:
+    return bool(reasons) and all(
+        any(r.startswith(p) for p in PATIENCE_PREFIXES) for r in reasons
+    )
+
+
+def watch_call(*, vetoed: bool, ok: bool, reasons: list[str]) -> str:
+    if ok:
+        return "trade"
+    if vetoed and not patience_only(reasons):
+        return "skip"
+    return "wait"
 
 
 def _sponsored(enr: Enrichment) -> bool:

@@ -64,7 +64,7 @@ class Http:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-            headers={"user-agent": "alpha-hound/0.1"},
+            headers={"user-agent": "FirstKill/0.1 (+https://github.com/Onassislisboa/alpha-hound)"},
             follow_redirects=True,
         )
         self._buckets: dict[str, TokenBucket] = {}

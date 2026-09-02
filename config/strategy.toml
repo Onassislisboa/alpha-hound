@@ -1,5 +1,5 @@
 # ===========================================================================
-# alpha-hound strategy configuration
+# FirstKill strategy configuration
 #
 # Everything here is a tunable. The learning loop is allowed to move some of
 # these (marked [auto]) based on realized PnL; the rest are yours alone.
@@ -10,7 +10,7 @@
 # independently of the entry scan so a slow RPC cannot delay a stop.
 tick_seconds = 3.0
 # Visor mcap/price. Own loop so a slow Stage-3 enrich cannot freeze the cards.
-quote_seconds = 0.5
+quote_seconds = 0.4
 # How often discovery runs and new candidates are scored.
 scan_seconds = 2.0
 # A candidate older than this is no longer an early signal, it is a chart.
@@ -209,9 +209,9 @@ max_position_pct = 0.16
 # At copy_min mcap this fraction of equity; interpolates up to max_position_pct at copy_max.
 min_position_pct = 0.06
 min_position_usd = 10.0
-# One coin at a time. Top memecoin traders do not pyramid.
-max_concurrent_positions = 1
-max_positions_per_chain = 1
+# Two open at once so a weak bag cannot occupy the only slot.
+max_concurrent_positions = 2
+max_positions_per_chain = 2
 # Hard cap on size as a fraction of pool liquidity. This binds long before the
 # equity cap does on a small pool, and it is the difference between a position
 # you can exit and a position you are.
@@ -225,9 +225,9 @@ max_entries_per_day = 5
 kelly_fraction = 0.25
 # Realized loss in a single day that halts trading until manually resumed.
 daily_loss_limit_pct = 0.12
-# Consecutive losses that trigger a cooldown.
-consecutive_loss_limit = 4
-cooldown_minutes_base = 15
+# Streak cooldown sits out the next runner. Off: wait on the coin instead.
+consecutive_loss_limit = 0
+cooldown_minutes_base = 0
 cooldown_backoff_multiplier = 2.0
 # Two tokens from the same deployer, or the same launch cohort, are one bet.
 max_exposure_per_deployer_pct = 0.06

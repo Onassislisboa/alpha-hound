@@ -1,13 +1,14 @@
 # FirstKill
 
-Paper bot for **new** launchpad memecoins. Package name stays `alphahound`.
+Paper trading bot for **new** launchpad memecoins. The product is FirstKill;
+the Python package and CLI stay `alphahound` (`python -m alphahound …`).
 
-A multi-chain trading bot that hunts tokens **before** the retail wave arrives, sizes
-every trade by expected value net of real costs, and rewrites its own scoring
-model from the money it loses.
+It hunts tokens **before** the retail wave, sizes by expected value net of
+round-trip cost, and retrains scoring from closed paper trades.
 
-Solana, BNB Chain, Base, Robinhood Chain, and the Robinhood Crypto brokerage.
-Paper mode by default; nothing here spends real money until you tell it to.
+**Default venue in this tree:** Robinhood Chain (`ENABLED_CHAINS=robinhood_chain`).
+Solana, BNB, and Base adapters exist; they stay off until you turn them on.
+Paper mode by default — nothing spends real money until `MODE=live`.
 
 ```bash
 python -m venv .venv && .venv/Scripts/activate     # Linux/macOS: source .venv/bin/activate
@@ -19,27 +20,32 @@ python -m alphahound preview --port 8765
 # open http://127.0.0.1:8765/
 ```
 
-Paper is on by default. The preview shows what it is allowed to trade (launchpad,
-age, copy window) and what is **in view**. Holds stay empty until a mint clears
-the gates **and** scores ≥ 58% win / ≥ 4% EV. On the public Solana RPC that
-almost never happens: holder counts, terminal attribution and sell quotes come
-back unmeasured, and unmeasured features contribute zero.
+The visor lists what is **in scan** (launchpad, age, copy window, DEX paid).
+Holds fill when a mint clears the gates **and** the score/EV floors in
+`config/strategy.toml` (paper today: win probability ≥ 42%, EV ≥ 4%, up to
+**2** concurrent positions). Click a card for the full CA, rubric, and p/EV
+of **that** mint.
 
-### Missing for a paper fill you can watch
+### Hood paper (what this checkout actually runs)
 
-1. Paid Solana RPC in `SOLANA_RPC_URL` (Helius / Triton / QuickNode). Public RPC rate-limits the enricher.
-2. `HELIUS_API_KEY` — exact holder counts. Without it the holder gate cannot pass in live, and paper scores blind.
-3. `python -m alphahound discover-terminals` then `label-terminal` at least one retail fee account. Until then `retail_share` is inert and the thesis cannot fire.
+Dexscreener + the Hood RPC in `.env.example` are enough to scan and paper-fill.
+`retail_share` / `axiom_share` stay **inert** until you label Solana terminal
+fee accounts — those features are Solana-terminal attribution, not Pons.
+
+### Extra for Solana paper/live
+
+1. Paid Solana RPC in `SOLANA_RPC_URL` (Helius / Triton / QuickNode).
+2. `HELIUS_API_KEY` — exact holder counts.
+3. `python -m alphahound discover-terminals` then `label-terminal` at least one retail fee account.
 4. Optional: `BIRDEYE_API_KEY`, `TWITTER_BEARER_TOKEN`, `BUBBLEMAPS_API_KEY`, `COPE_API_KEY`, wallets in `config/whales.toml`.
 
-### Missing for live (Solana first)
+### Missing for live (any chain)
 
-1. `JUPITER_API_KEY` from [portal.jup.ag](https://portal.jup.ag).
-2. Fund the Solana hot wallet with a small amount of SOL. It is a hot wallet.
-3. `MODE=live`. Keep `ENABLED_CHAINS=solana` until paper has ~40 closed trades.
-4. BNB live also needs `ZEROEX_API_KEY` and BNB on that wallet. Robinhood Chain live needs ETH on chain 4663 for gas.
+1. Solana live: `JUPITER_API_KEY` from [portal.jup.ag](https://portal.jup.ag) and a small hot wallet.
+2. `MODE=live`. Keep paper until ~40 closed trades before trusting learned weights.
+3. BNB live also needs `ZEROEX_API_KEY`. Robinhood Chain live needs ETH on chain 4663 for gas.
 
-No extra bot framework. Swaps go through **Jupiter** (Solana), **0x** (BNB), **Uniswap V3** (Robinhood Chain). Fomo / Moby / Padre are research-only.
+Swaps go through **Jupiter** (Solana), **0x** (BNB), **Uniswap V3** (Robinhood Chain), or the paper simulator. Fomo / Moby / Padre are research-only (labeled wallets, never execution).
 
 ---
 
@@ -72,6 +78,10 @@ Those two conditions have opposite signs, deliberately:
 You are competing on *information quality and reaction speed against the crowd*,
 not on transaction ordering against an individual. `src/alphahound/signals/terminals.py`
 implements it and explains the mechanics.
+
+On the **default Hood paper** checkout those terminal features stay at zero
+until you enable Solana and label fee accounts. Scoring still uses Dexscreener,
+copy wallets, and socials.
 
 ## What is real and what is not
 
@@ -197,8 +207,8 @@ Four independent, deliberately redundant brakes:
   position you can exit and a position you *are*.
 - **Daily loss limit** trips the kill switch, which **closes open positions**
   rather than merely blocking new ones.
-- **Escalating cooldown** after consecutive losses. Not superstition: N losses
-  in a row is the cheapest evidence that the model's current view is wrong.
+- **Consecutive-loss cooldown** exists in config (`risk.cooldown_minutes_base`)
+  and is **off** in the shipped paper file so a streak does not sit out a runner.
 - **Per-deployer exposure cap** — two tokens from one deployer are one bet.
 - Equity is recomputed as starting capital + realized PnL, so a drawdown
   shrinks position sizes instead of compounding into a hole.
@@ -390,7 +400,7 @@ src/alphahound/
   learning.py             postmortem, nudges, training, filter cost
   backtest.py             decision-log replay
   engine.py               the loop
-tests/test_core.py        77 tests, stdlib only, no install needed
+tests/test_core.py        stdlib only, no install needed
 ```
 
 Core modules are stdlib-only on purpose: `python tests/test_core.py` runs with
@@ -405,10 +415,11 @@ pip install -e ".[solana]" # just Solana trading
 
 ## Going live
 
-`Settings.validate()` refuses to start a misconfigured live bot, because the
-failure mode of a half-configured one is a wallet, not a stack trace. It
-requires, among other things, that `SOLANA_RPC_URL` is **not** the public
-endpoint — that endpoint will rate-limit you out of every trade worth making.
+`Settings.validate()` refuses to start a misconfigured live bot: the failure
+mode is a wallet, not a stack trace. Checks are **per enabled chain** — Hood-only
+live does not require a Solana RPC. If Solana is enabled, `SOLANA_RPC_URL` must
+not be the public endpoint (it will rate-limit you out of every trade worth
+making).
 
 Before flipping `MODE=live`:
 
@@ -418,7 +429,7 @@ Before flipping `MODE=live`:
 2. `alphahound backtest --compare` — have the learned weights actually beaten
    the priors?
 3. `alphahound filter-cost` — are your gates costing more than they save?
-4. Label at least one retail terminal, or the central feature is inert.
+4. If you enable Solana: label at least one retail terminal, or `retail_share` is inert.
 5. Set `risk.equity_usd` to money you can lose entirely.
 6. Fund the trading wallet with a small balance. It is a hot wallet by
    definition; use a KMS/HSM signer for anything serious.

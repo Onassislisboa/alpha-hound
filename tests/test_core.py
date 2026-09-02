@@ -47,6 +47,7 @@ from alphahound.scoring import (  # noqa: E402
     expected_value,
     normalize,
     payoff_from_config,
+    watch_call,
 )
 from alphahound.settings import Config, load_strategy  # noqa: E402
 from alphahound.signals import Enrichment  # noqa: E402
@@ -352,6 +353,42 @@ class TestGates(unittest.TestCase):
         enr.round_trip = RoundTrip(ok=True, sell_slippage=0.60, total_cost_pct=0.02)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("sellable" in v for v in vetoes))
+
+    def test_watch_call_waits_for_a_dip_not_a_hard_skip(self):
+        self.assertEqual(
+            watch_call(vetoed=True, ok=False, reasons=["chase: 5m ripped, wait dip"]),
+            "wait",
+        )
+        self.assertEqual(
+            watch_call(
+                vetoed=True, ok=False, reasons=["round_trip_cost: round trip costs 7.2%"]
+            ),
+            "wait",
+        )
+        self.assertEqual(watch_call(vetoed=True, ok=False, reasons=["vamp: clone"]), "skip")
+        self.assertEqual(
+            watch_call(vetoed=True, ok=False, reasons=["chase: rip", "vamp: clone"]),
+            "skip",
+        )
+        self.assertEqual(watch_call(vetoed=False, ok=False, reasons=[]), "wait")
+        self.assertEqual(watch_call(vetoed=False, ok=True, reasons=[]), "trade")
+
+    def test_hood_official_x_is_not_required(self):
+        enr = self.enrichment(twitter_mentions=5.0)
+        enr.candidate.chain = Chain.ROBINHOOD_CHAIN
+        enr.candidate.dex_id = "uniswap"
+        enr.candidate.mcap_usd = 250_000
+        enr.candidate.volume_5m_usd = 12_000
+        enr.candidate.ret_5m = 0.0
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any(v.startswith("twitter:") for v in vetoes), vetoes)
+        enr.candidate.ret_5m = 0.28
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertTrue(any("chase" in v for v in vetoes), vetoes)
+        enr.twitter = {"official": "hotdogcoin", "official_age_min": 18}
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
+        self.assertFalse(any("chase" in v for v in vetoes), vetoes)
 
     def test_free_data_prefilter_rejects_early_but_never_approves(self):
         from alphahound.scoring import Model, Scorer
@@ -682,6 +719,16 @@ class TestRisk(unittest.TestCase):
         self.assertFalse(sizing.allowed)
         self.assertIn("recently", sizing.reason)
 
+    def test_streak_does_not_halt_when_cooldown_is_off(self):
+        from alphahound.risk import COOLDOWN_UNTIL_KEY
+
+        self.store.record_trade(_trade(pnl=-1.0))
+        self.risk.note_trade_closed(won=False)
+        self.assertEqual(self.store.get_kv(COOLDOWN_UNTIL_KEY, "0"), "0")
+        self.store.set_kv(COOLDOWN_UNTIL_KEY, str(10**15))
+        halted, reason = self.risk.halted()
+        self.assertFalse(halted, reason)
+
     def test_daily_entry_cap(self):
         score = Score(probability=0.90, expected_value=0.5)
         payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
@@ -748,6 +795,13 @@ class TestExits(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertIs(orders[0].reason, ExitReason.LIQUIDITY_DRAIN)
         self.assertEqual(orders[0].fraction, 1.0)
+
+    def test_stale_peak_liq_after_restore_is_not_a_drain(self):
+        position = self.position()
+        self.manager.observe(position, 1.0, 162_000.0)
+        position.peak_liquidity_usd = 0.0
+        orders = self.manager.evaluate(position, 0.80, 91_000.0)
+        self.assertFalse(any(o.reason is ExitReason.LIQUIDITY_DRAIN for o in orders))
 
     def test_stop_loss(self):
         orders = self.manager.evaluate(self.position(), 0.50, 100_000.0)

@@ -5,8 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alphahound"
 version = "0.1.0"
-description = "FirstKill: multi-chain early-signal trading bot"
+description = "FirstKill: paper memecoin bot (Robinhood Chain / multi-chain)"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
 dependencies = [
     "httpx>=0.27",
 ]
@@ -27,6 +29,10 @@ all = [
 
 [project.scripts]
 alphahound = "alphahound.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Onassislisboa/alpha-hound"
+Repository = "https://github.com/Onassislisboa/alpha-hound"
 
 [tool.setuptools.packages.find]
 where = ["src"]

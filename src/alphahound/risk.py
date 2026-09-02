@@ -10,7 +10,7 @@ Four independent brakes, deliberately redundant:
 * size caps      - no single trade can matter that much
 * liquidity cap  - no position larger than the pool can give back
 * daily loss     - a bad day ends by itself
-* cooldown       - a losing streak gets slower, not louder
+* cooldown       - optional; off by default so a streak does not sit out a runner
 """
 
 from __future__ import annotations
@@ -95,8 +95,9 @@ class RiskEngine:
             )
             return True, f"daily loss limit hit ({day_pnl:+.2f} USD)"
 
+        base = float(self._p("cooldown_minutes_base", 15.0))
         until = int(self.store.get_kv(COOLDOWN_UNTIL_KEY, "0") or 0)
-        if until > now_ms():
+        if base > 0 and until > now_ms():
             remaining = (until - now_ms()) / 60_000.0
             return True, f"cooldown active for {remaining:.1f} more minutes"
         return False, ""
@@ -123,11 +124,13 @@ class RiskEngine:
             self.store.set_kv(COOLDOWN_LEVEL_KEY, "0")
             return
         limit = int(self._p("consecutive_loss_limit", 4))
+        base = float(self._p("cooldown_minutes_base", 15.0))
+        if limit <= 0 or base <= 0:
+            return
         streak = self.store.consecutive_losses()
         if streak < limit:
             return
         level = int(self.store.get_kv(COOLDOWN_LEVEL_KEY, "0") or 0)
-        base = self._p("cooldown_minutes_base", 15.0)
         mult = self._p("cooldown_backoff_multiplier", 2.0)
         minutes = base * (mult**level)
         self.store.set_kv(COOLDOWN_UNTIL_KEY, str(now_ms() + int(minutes * 60_000)))
