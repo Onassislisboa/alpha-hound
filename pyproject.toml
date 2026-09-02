@@ -31,8 +31,8 @@ all = [
 alphahound = "alphahound.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/Onassislisboa/alpha-hound"
-Repository = "https://github.com/Onassislisboa/alpha-hound"
+Homepage = "https://github.com/Onassislisboa/firstkill"
+Repository = "https://github.com/Onassislisboa/firstkill"
 
 [tool.setuptools.packages.find]
 where = ["src"]
