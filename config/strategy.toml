@@ -180,7 +180,7 @@ min_probability = 0.42
 # Minimum expected value, as a fraction of position size, AFTER subtracting
 # every cost we can predict. A positive score with negative EV is a losing
 # trade with good self-esteem.
-min_expected_value = 0.0
+min_expected_value = 0.04
 # Stage-2 0–10 composite. Weights: dist 20, crowd 25, flow 20, chart 25, narrative 10.
 # Below this the token is not a buy candidate even if EV looks fine.
 min_rubric = 4.0
