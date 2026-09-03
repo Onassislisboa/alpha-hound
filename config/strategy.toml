@@ -204,6 +204,19 @@ prior_winner_ladder_reach = [[1, 0.60], [2, 0.25], [3, 0.15]]
 
 
 # ---------------------------------------------------------------------------
+# Aggressive learning. One `enabled` flip. Production [scoring]/[risk] above
+# stay the graduate-to values. Does not touch gates (LP, mint, bundle, cluster).
+# Floors from unique reject_score p/EV: 0.38/0.03 ≈ 3× vs 0.42/0.048.
+# ---------------------------------------------------------------------------
+[aggressive_learning]
+enabled = true
+graduate_at_closes = 40
+min_probability = 0.38
+min_expected_value = 0.03
+max_concurrent_positions = 4
+
+
+# ---------------------------------------------------------------------------
 # Risk. The only part of this system that reliably makes money is the part
 # that stops it from losing.
 # ---------------------------------------------------------------------------
@@ -227,8 +240,8 @@ max_positions_per_chain = 2
 max_position_pct_of_liquidity = 0.008
 # After a close, do not bounce the same mint. One entry, one story.
 reentry_cooldown_minutes = 180
-# Few well-selected trades, not a spray.
-max_entries_per_day = 5
+# 0 = off. Paper learning phase — no daily entry budget.
+max_entries_per_day = 0
 # Fractional Kelly. Full Kelly is correct only if your probabilities are
 # correct, and yours are not.
 kelly_fraction = 0.25

@@ -22,7 +22,15 @@ from .playbook import gate as pb_gate
 from .providers import Dexscreener
 from .risk import RiskEngine
 from .scoring import Model
-from .settings import Settings, chase_rows, load_strategy, load_terminals
+from .settings import (
+    Settings,
+    aggressive_closes_since_on,
+    apply_aggressive_learning,
+    chase_rows,
+    load_strategy,
+    load_terminals,
+    score_floors,
+)
 from .signals.solana import SolanaReader
 from .signals.terminals import discover_fee_accounts
 from .store import Store
@@ -73,6 +81,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     settings, strategy = _bootstrap()
     terminals = load_terminals()
     store = Store(settings.state_dir)
+    strategy = apply_aggressive_learning(strategy, store)
     registry = build_registry(store, terminals)
 
     print(f"FirstKill {__version__}")
@@ -88,6 +97,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"  open slots        {int(strategy.get('risk.max_concurrent_positions', 1))}"
         f" concurrent / {int(strategy.get('risk.max_positions_per_chain', 1))} per chain"
     )
+    min_p, min_ev = score_floors(strategy, store)
+    equity = RiskEngine(strategy, store).equity()
+    min_pct = float(strategy.get("risk.min_position_pct", 0))
+    max_pct = float(strategy.get("risk.max_position_pct", 0))
+    print(f"  score floors      p>={min_p:.3f}  ev>={min_ev:.3f}")
+    print(
+        f"  size band         {min_pct:.1%}–{max_pct:.1%} equity"
+        f" (~${equity * min_pct:.0f}–${equity * max_pct:.0f})"
+    )
+    ag = strategy.section("aggressive_learning")
+    if strategy.get("aggressive_learning._active"):
+        need = int(ag.get("graduate_at_closes", 40))
+        since = aggressive_closes_since_on(store)
+        print(
+            f"  learning mode     aggressive"
+            f" ({store.trade_count()}/{need} closes, {since} since on)"
+        )
+        tuned_ev = store.param(
+            "scoring.min_expected_value",
+            float(strategy.get("scoring.min_expected_value", 0)),
+        )
+        if tuned_ev > min_ev + 1e-9:
+            print(
+                f"     self-tune wants ev {tuned_ev:.3f} vs aggressive {min_ev:.3f}"
+                " — fighting (aggressive wins until graduate)"
+            )
+    elif ag.get("enabled"):
+        print(
+            f"  learning mode     production"
+            f" (aggressive graduated at {int(ag.get('graduate_at_closes', 40))} closes)"
+        )
     print(
         f"  shadow track      {int(float(strategy.get('learning.shadow_track_minutes', 60)))} min"
     )
@@ -140,6 +180,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"  ! {problem}")
     else:
         print("\nconfiguration looks usable" + (" (live)" if settings.live else " (paper)"))
+    print(
+        "  account floor     none — daily loss halt "
+        f"{float(strategy.get('risk.daily_loss_limit_pct', 0)):.0%} of base equity;"
+        " no $15–20 equity stop"
+    )
 
     # Connectivity, only when asked, because it costs requests.
     if args.check_network:
@@ -433,6 +478,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
 
     settings, strategy = _bootstrap()
     store = Store(settings.state_dir)
+    strategy = apply_aggressive_learning(strategy, store)
     equity = RiskEngine(strategy, store).equity()
     serve(settings.state_dir, store, equity, args.port, settings, strategy)
     return 0

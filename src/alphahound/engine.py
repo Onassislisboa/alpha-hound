@@ -54,9 +54,11 @@ from .settings import (
     PUBLIC_SOLANA_RPC,
     Config,
     Settings,
+    apply_aggressive_learning,
     chase_rows,
     load_strategy,
     load_terminals,
+    score_floors,
 )
 from .signals import Enricher, Enrichment
 from .signals.pack import apply_tags, dump_beta_keys
@@ -99,6 +101,7 @@ class Engine:
         self.terminals = terminals or load_terminals()
 
         self.store = Store(settings.state_dir)
+        self.strategy = apply_aggressive_learning(self.strategy, self.store)
         self.http = Http()
         self.dex = Dexscreener(
             self.http,
@@ -186,6 +189,7 @@ class Engine:
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
 
+        min_p, min_ev = score_floors(self.strategy, self.store)
         log.info(
             "starting",
             extra={
@@ -197,11 +201,12 @@ class Engine:
                 "shadow_track_minutes": int(
                     float(self.strategy.get("learning.shadow_track_minutes", 60))
                 ),
-                "min_expected_value": float(self.strategy.get("scoring.min_expected_value", 0)),
-                "min_probability": float(self.strategy.get("scoring.min_probability", 0)),
+                "min_expected_value": min_ev,
+                "min_probability": min_p,
                 "max_concurrent_positions": int(
                     self.strategy.get("risk.max_concurrent_positions", 1)
                 ),
+                "aggressive_learning": bool(self.strategy.get("aggressive_learning._active")),
             },
         )
         if not self.registry.attributable_labels:
@@ -697,21 +702,10 @@ class Engine:
         await self._enter(decision, decision_id, buyers=buyers, sponsors=sponsors)
 
     def _buy_floors(self) -> dict[str, float]:
+        min_p, min_ev = score_floors(self.strategy, self.store)
         return {
-            "min_p": round(
-                self.store.param(
-                    "scoring.min_probability",
-                    float(self.strategy.get("scoring.min_probability", 0.56)),
-                ),
-                4,
-            ),
-            "min_ev": round(
-                self.store.param(
-                    "scoring.min_expected_value",
-                    float(self.strategy.get("scoring.min_expected_value", 0.035)),
-                ),
-                4,
-            ),
+            "min_p": round(min_p, 4),
+            "min_ev": round(min_ev, 4),
             "min_rubric": round(float(self.strategy.get("scoring.min_rubric", 7.0)), 1),
         }
 

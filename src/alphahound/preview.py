@@ -17,7 +17,16 @@ from urllib.parse import parse_qs, urlparse
 from .models import Chain, now_ms, describe_error, describe_exit
 from .playbook import max_age_minutes
 from .risk import RiskEngine
-from .settings import Config, Settings, load_fomo, load_kols, save_fomo, save_kols
+from .settings import (
+    Config,
+    Settings,
+    aggressive_closes_since_on,
+    load_fomo,
+    load_kols,
+    save_fomo,
+    save_kols,
+    score_floors,
+)
 from .store import Store
 
 PREVIEW_NAME = "preview.json"
@@ -191,6 +200,10 @@ def assemble(
         "kols": load_kols(state_dir),
         "fomo": load_fomo(state_dir),
         "pnl_chart": book["pnl_chart"],
+        "aggressive": bool(strategy and strategy.get("aggressive_learning._active")),
+        "aggressive_closes": aggressive_closes_since_on(store) if strategy else 0,
+        "min_p": score_floors(strategy, store)[0] if strategy else None,
+        "min_ev": score_floors(strategy, store)[1] if strategy else None,
     }
 
 
@@ -1004,7 +1017,8 @@ async function tick() {
   catch (err) { $('status').textContent = 'offline'; inflight = false; return; }
   const live = d.running ? (d.mode || 'run') : 'stopped';
   const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
-  $('status').textContent = live + halt + ' · ' + d.stale_s + 's';
+  const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
+  $('status').textContent = live + halt + learn + ' · ' + d.stale_s + 's';
   setText('equity', usd(d.equity_usd), 'n');
   setText('pnl', usd(d.pnl), 'n '+cls(d.pnl));
   setText('winrate', d.win_rate == null ? '—' : Math.round(d.win_rate*100)+'%',

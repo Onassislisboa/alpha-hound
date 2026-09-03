@@ -49,7 +49,7 @@ from alphahound.scoring import (  # noqa: E402
     payoff_from_config,
     watch_call,
 )
-from alphahound.settings import Config, load_strategy  # noqa: E402
+from alphahound.settings import Config, apply_aggressive_learning, load_strategy, score_floors  # noqa: E402
 from alphahound.signals import Enrichment  # noqa: E402
 from alphahound.signals import chart, flow  # noqa: E402
 from alphahound.signals.distribution import Holder, analyze, gini  # noqa: E402
@@ -750,9 +750,10 @@ class TestRisk(unittest.TestCase):
         self.assertFalse(halted, reason)
 
     def test_daily_entry_cap(self):
+        self.store.set_param("risk.max_entries_per_day", 5, "test")
         score = Score(probability=0.90, expected_value=0.5)
         payoff = Payoff(avg_win=1.0, avg_loss=0.25, samples=50, from_history=True)
-        for i in range(int(STRATEGY.get("risk.max_entries_per_day", 5))):
+        for i in range(5):
             self.store.record_decision(
                 Decision(
                     candidate=Candidate(
@@ -772,6 +773,39 @@ class TestRisk(unittest.TestCase):
         )
         self.assertFalse(sizing.allowed)
         self.assertIn("daily cap", sizing.reason)
+
+
+class TestAggressiveLearning(unittest.TestCase):
+    def setUp(self):
+        self.store, self._tmp = make_store()
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_overlay_more_slots_same_total_cap(self):
+        cfg = apply_aggressive_learning(STRATEGY, self.store)
+        self.assertTrue(cfg.get("aggressive_learning._active"))
+        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 4)
+        self.assertAlmostEqual(float(cfg.get("risk.max_position_pct")), 0.08, places=4)
+        self.assertGreaterEqual(float(cfg.get("risk.min_position_pct")), 0.05 - 1e-9)
+        self.store.set_param("scoring.min_expected_value", 0.048, "test")
+        p, ev = score_floors(cfg, self.store)
+        self.assertAlmostEqual(p, 0.38, places=4)
+        self.assertAlmostEqual(ev, 0.03, places=4)
+
+    def test_graduates_back_to_production(self):
+        for _ in range(40):
+            self.store.record_trade(_trade(pnl=-1.0))
+        cfg = apply_aggressive_learning(STRATEGY, self.store)
+        self.assertFalse(cfg.get("aggressive_learning._active"))
+        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
+        self.assertEqual(self.store.get_kv("aggressive_graduated"), "1")
+
+    def test_tiny_bankroll_keeps_two_slots(self):
+        thin = STRATEGY.overlay({"risk": {"equity_usd": 40.0}})
+        cfg = apply_aggressive_learning(thin, self.store)
+        self.assertEqual(int(cfg.get("risk.max_concurrent_positions")), 2)
 
 
 class TestExits(unittest.TestCase):

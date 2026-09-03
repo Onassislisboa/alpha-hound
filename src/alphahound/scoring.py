@@ -26,7 +26,7 @@ from .log import get
 from .models import Features, Position, Score, TradeRecord, now_ms
 from .verdict import bot_veto, classify
 from .portfolio import banked_from_peak
-from .settings import Config
+from .settings import Config, score_floors
 from .origin import launchpad_origin
 from .playbook import gate as pb_gate
 from .playbook import section as pb_section
@@ -763,13 +763,7 @@ class Scorer:
     def passes(self, score: Score) -> tuple[bool, str]:
         if score.vetoed:
             return False, score.veto_reasons[0]
-        min_p = self.store.param(
-            "scoring.min_probability", float(self.strategy.get("scoring.min_probability", 0.56))
-        )
-        min_ev = self.store.param(
-            "scoring.min_expected_value",
-            float(self.strategy.get("scoring.min_expected_value", 0.035)),
-        )
+        min_p, min_ev = score_floors(self.strategy, self.store)
         if score.probability < min_p:
             return False, f"probability {score.probability:.3f} < {min_p:.3f}"
         if score.expected_value < min_ev:
