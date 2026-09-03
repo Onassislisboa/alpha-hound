@@ -437,10 +437,8 @@ class Engine:
                 orders = [
                     ExitOrder(1.0, ExitReason.THESIS_CUT, "beta: main runner dumping")
                 ]
-            if halted and not orders:
-                # The kill switch closes positions rather than merely stopping
-                # new ones. Halting entries while holding open risk is the
-                # worst of both states.
+            if halted:
+                # Flatten everything. A TP rung in the same tick must not leave a stub.
                 orders = [ExitOrder(1.0, ExitReason.KILL_SWITCH, reason)]
             full = any(o.fraction >= 1.0 for o in orders)
             if not full:

@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .models import Chain, now_ms, describe_error, describe_exit
 from .playbook import max_age_minutes
+from .risk import RiskEngine
 from .settings import Config, Settings, load_fomo, load_kols, save_fomo, save_kols
 from .store import Store
 
@@ -233,6 +234,9 @@ HTML = """<!doctype html>
                  color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent;
                  padding: 8px 12px; cursor: pointer; }
   .tabs button.on { color: #fff; border-bottom-color: #ff3b4e; }
+  #dump-all { font: inherit; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+              margin: 8px 20px 0 auto; padding: 8px 14px; cursor: pointer;
+              background: #2a0008; color: #ff6b7a; border: 1px solid #ff3b4e; border-radius: 4px; }
   .panel { display: none; }
   .panel.on { display: block; }
   .kol-form { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 20px; }
@@ -360,6 +364,7 @@ HTML = """<!doctype html>
   <button type="button" data-tab="tab-fomo">fomo</button>
   <button type="button" data-tab="tab-review">review</button>
   <button type="button" data-tab="tab-pnl">pnl</button>
+  <button type="button" id="dump-all">vender tudo</button>
 </nav>
 <div id="tab-watch" class="panel on">
 <section class="full" style="padding:14px 20px 6px">
@@ -838,6 +843,13 @@ function paintVerdict(d) {
   hint.textContent = 'zero a zero · '+d.wins+'W / '+losses+'L';
 }
 
+$('dump-all').addEventListener('click', () => {
+  if (!confirm('Vender todas as posições abertas agora?')) return;
+  fetch('/api/flatten', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(r => r.json()).then(j => {
+      $('status').textContent = j.ok ? 'vendendo tudo…' : (j.error || 'falhou vender');
+    }).catch(() => { $('status').textContent = 'falhou vender'; });
+});
 document.addEventListener('click', e => {
   const tab = e.target.closest('[data-tab]');
   if (tab) {
@@ -1145,6 +1157,21 @@ def serve(
                 body = json.loads(self.rfile.read(n).decode() if n else "{}")
             except ValueError:
                 body = {}
+            if path == "/api/flatten":
+                if strategy is None:
+                    out = json.dumps({"ok": False, "error": "no strategy"}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(out)
+                    return
+                RiskEngine(strategy, store).engage_kill_switch("vender tudo")
+                out = json.dumps({"ok": True, "halted": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+                return
             if path == "/api/inspect":
                 addr = str(body.get("address") or "").strip()
                 pending: list = []
