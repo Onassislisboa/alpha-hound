@@ -12,6 +12,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+ZERO_ADDR = "0x" + "0" * 40
+TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+@dataclass(slots=True)
+class TokenMove:
+    block: int
+    frm: str
+    to: str
+    amount: float
+
 
 @dataclass(slots=True)
 class Holder:
@@ -41,6 +52,78 @@ class HolderStats:
     bundle_pct: float = 0.0
     largest_funding_cluster_pct: float = 0.0
     notes: list[str] = field(default_factory=list)
+
+
+def _topic_addr(topic: str) -> str:
+    t = (topic or "").lower().replace("0x", "")
+    return ("0x" + t[-40:]) if len(t) >= 40 else ""
+
+
+def decode_transfer_log(raw: dict) -> TokenMove | None:
+    topics = raw.get("topics") or []
+    if len(topics) < 3 or str(topics[0]).lower() != TRANSFER_TOPIC0:
+        return None
+    data = raw.get("data") or "0x0"
+    try:
+        amount = float(int(data, 16))
+        block = int(raw.get("blockNumber") or "0x0", 16)
+    except ValueError:
+        return None
+    frm, to = _topic_addr(str(topics[1])), _topic_addr(str(topics[2]))
+    if not frm or not to:
+        return None
+    return TokenMove(block=block, frm=frm, to=to, amount=amount)
+
+
+def holders_from_moves(
+    moves: list[TokenMove],
+    *,
+    pools: set[str] | None = None,
+    deployer: str = "",
+    first_n: int = 40,
+) -> tuple[list[Holder], int]:
+    """Holders + launch block from ERC-20 Transfer logs.
+
+    `funder` is the first non-pool sender into the wallet (token hop). Same-block
+    snipers still show up via acquired_slot even when they bought from the pool.
+    """
+    if not moves:
+        return [], 0
+    ordered = sorted(moves, key=lambda m: m.block)
+    launch = ordered[0].block
+    pools = {p.lower() for p in (pools or set()) if p}
+    deployer = deployer.lower()
+    bal: dict[str, float] = {}
+    first_block: dict[str, int] = {}
+    funder: dict[str, str] = {}
+    early_n = 0
+    for m in ordered:
+        to, frm = m.to.lower(), m.frm.lower()
+        if to not in pools and to != ZERO_ADDR:
+            bal[to] = bal.get(to, 0.0) + m.amount
+            if to not in first_block:
+                first_block[to] = m.block
+                if frm not in pools:
+                    funder[to] = frm if early_n < first_n else funder.get(to, "")
+                    if early_n < first_n:
+                        early_n += 1
+        if frm not in pools and frm != ZERO_ADDR:
+            bal[frm] = bal.get(frm, 0.0) - m.amount
+    holders = []
+    for addr, amount in bal.items():
+        if amount <= 0 or addr in pools:
+            continue
+        holders.append(
+            Holder(
+                address=addr,
+                balance=amount,
+                acquired_slot=first_block.get(addr, 0),
+                funder=funder.get(addr, ""),
+                is_lp=False,
+                is_deployer=bool(deployer) and addr == deployer,
+            )
+        )
+    return holders, launch
 
 
 def gini(values: list[float]) -> float:

@@ -357,17 +357,15 @@ def evaluate_gates(
     if max_chase > 0 and enr.candidate.ret_5m > max_chase and not thesis:
         vetoes.append("chase: 5m ripped, wait dip")
     max_cluster = p("max_cluster_pct", 0.0)
+    probed = enr.chain_probed or enr.mint is not None
     if max_cluster > 0 and "cluster_pct" not in unknown and f.cluster_pct > max_cluster:
         vetoes.append(f"cluster: {f.cluster_pct:.0%} linked supply")
     elif (
-        chain.value == "solana"
-        and enr.mint is not None
+        probed
         and ((max_cluster > 0 and "cluster_pct" in unknown) or "top1_pct" in unknown)
         and not enr.candidate.dex_paid
     ):
-        # Solana rugs look fine on mcap until the bubble is measured. Cheap
-        # prefilter has mint=None so it still passes; after we touched chain
-        # data, unmeasured cluster is a skip — not a visor souvenir.
+        # Rugs look fine on mcap until the bubble is measured.
         vetoes.append("rug_filter: distribution unmeasured, skip")
     if (
         chain.value == "solana"
@@ -491,9 +489,9 @@ def evaluate_gates(
             "unmeasured: " + ", ".join(abstained) + " (set gates.allow_unmeasured "
             "to trade blind on purpose)"
         )
-    # Cheap prefilter has mint=None; a full enrich has it. Don't grey-skip
-    # every Solana mint before holders are fetched.
-    if enr.mint is not None:
+    # Cheap prefilter has mint=None / chain_probed=False. Don't grey-skip
+    # every mint before holders are fetched.
+    if enr.chain_probed or enr.mint is not None:
         extra = bot_veto(
             classify(f, unknown, age_minutes=enr.candidate.age_minutes),
             chain.value,

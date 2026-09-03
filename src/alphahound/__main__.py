@@ -18,6 +18,7 @@ from .discovery import Discovery
 from .engine import Engine, build_registry
 from .models import Chain
 from .net import Http
+from .playbook import gate as pb_gate
 from .providers import Dexscreener
 from .risk import RiskEngine
 from .scoring import Model
@@ -87,6 +88,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"  open slots        {int(strategy.get('risk.max_concurrent_positions', 1))}"
         f" concurrent / {int(strategy.get('risk.max_positions_per_chain', 1))} per chain"
     )
+    print(
+        f"  shadow track      {int(float(strategy.get('learning.shadow_track_minutes', 60)))} min"
+    )
+    chain0 = settings.enabled_chains[0] if settings.enabled_chains else None
+    if chain0 is not None:
+        print(
+            f"  bundle/cluster    max_bundle {pb_gate(strategy, chain0, 'max_bundle_pct', 0.20, store):.0%}"
+            f"  max_cluster {pb_gate(strategy, chain0, 'max_cluster_pct', 0.20, store):.0%}"
+            " (hard veto)"
+        )
 
     engaged = store.get_kv("kill_switch") == "1"
     print(f"  kill switch       {'ENGAGED - ' + store.get_kv('kill_switch_reason') if engaged else 'clear'}")

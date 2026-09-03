@@ -66,6 +66,73 @@ class ExitReason(str, Enum):
     MANUAL = "manual"
 
 
+# Portuguese operator copy. Logic lives in portfolio/engine/learning; this is display only.
+EXIT_WHY: dict[str, str] = {
+    "take_profit": "Vendeu uma fatia porque o preço bateu um degrau da escada de lucro.",
+    "trailing_stop": "Depois do primeiro lucro parcial, o preço caiu longe demais do pico e vendeu o que restava.",
+    "stop_loss": "O preço caiu da entrada além do stop duro — cortou a perda.",
+    "time_stop": "Ficou tempo demais sem andar o suficiente; soltou o capital para outra coisa.",
+    "liquidity_drain": "A liquidez da pool caiu forte em relação ao pico — típico de LP saindo.",
+    "thesis_cut": "A tese da entrada quebrou (pico esfriou, fita de 5m virou, ou o hold reavaliou e vetou) — saiu antes do stop duro.",
+    "kill_switch": "O kill switch fechou a posição aberta, não só bloqueou entradas novas.",
+    "manual": "Saída pedida na mão.",
+}
+
+ERROR_WHY: dict[str, str] = {
+    "win": "Fechou no lucro, sem devolver o pico de um jeito absurdo.",
+    "exit_too_fast": "Ganhou, mas devolveu a maior parte do que chegou a estar positivo.",
+    "exit_too_slow": "Chegou a subir o bastante para ter realizado e mesmo assim fechou perdido.",
+    "no_edge": "O sinal na entrada estava ok; o token simplesmente esfriou.",
+    "rug": "A liquidez evaporou (saída classificada a partir de liquidity_drain).",
+    "late_entry": "O fill ficou bem mais caro que o preço do sinal.",
+    "slippage_blowout": "A entrada escorregou demais no fill.",
+    "adverse_selection": "No launch já tinha bundle/bots demais — entrou no float errado.",
+    "execution_fail": "A execução falhou.",
+}
+
+GATE_WHY: dict[str, str] = {
+    "bundle": "Muita supply comprada no bloco de lançamento.",
+    "cluster": "Wallets ligadas na mesma origem (funding) acima do limite.",
+    "rug_filter": "Distribuição não medida; pulou para não comprar às cegas.",
+    "volume": "Volume de 5 minutos abaixo do mínimo do playbook.",
+    "twitter": "Menções/oficial no X não passaram no filtro.",
+    "chase": "O 5 minutos já tinha disparado; esperava o dip.",
+    "priced": "Market cap já passou da janela de copy.",
+    "mcap": "Market cap fora da janela permitida.",
+    "round_trip_cost": "Ida e volta (spread+taxa) comiam o edge.",
+    "launchpad": "Não é launchpad permitido nesta chain.",
+    "liquidity": "Liquidez abaixo do mínimo.",
+    "bundled": "Leitura de distribuição: float fabricado.",
+    "cabaled": "Leitura de distribuição: grupo interno no float.",
+    "sponsor": "KOL/whale que justificava a bag saiu.",
+    "rubric": "A nota de hold caiu abaixo do mínimo por strikes seguidos.",
+    "score": "Probabilidade ou EV abaixo do piso.",
+}
+
+
+def describe_exit(code: str | ExitReason) -> str:
+    key = code.value if isinstance(code, ExitReason) else (code or "")
+    return EXIT_WHY.get(key, "")
+
+
+def describe_error(code: str | ErrorClass) -> str:
+    key = code.value if isinstance(code, ErrorClass) else (code or "")
+    return ERROR_WHY.get(key, "")
+
+
+def describe_code(code: str) -> str:
+    """Exit, postmortem class, or gate prefix — first match."""
+    raw = (code or "").strip()
+    if not raw:
+        return ""
+    if raw in EXIT_WHY:
+        return EXIT_WHY[raw]
+    if raw in ERROR_WHY:
+        return ERROR_WHY[raw]
+    prefix = raw.split(":", 1)[0].strip()
+    return GATE_WHY.get(prefix, "")
+
+
 class ErrorClass(str, Enum):
     """Loss taxonomy. Each class maps to one specific parameter nudge in
     `learning.postmortem`; a bucket that does not imply an action is a bucket

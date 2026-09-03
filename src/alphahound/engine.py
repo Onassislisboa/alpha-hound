@@ -194,6 +194,14 @@ class Engine:
                 "weights_version": self.scorer.model.version,
                 "equity_usd": self.risk.equity(),
                 "open_positions": len(self.positions),
+                "shadow_track_minutes": int(
+                    float(self.strategy.get("learning.shadow_track_minutes", 60))
+                ),
+                "min_expected_value": float(self.strategy.get("scoring.min_expected_value", 0)),
+                "min_probability": float(self.strategy.get("scoring.min_probability", 0)),
+                "max_concurrent_positions": int(
+                    self.strategy.get("risk.max_concurrent_positions", 1)
+                ),
             },
         )
         if not self.registry.attributable_labels:

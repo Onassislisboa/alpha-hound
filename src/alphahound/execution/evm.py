@@ -73,6 +73,10 @@ class EvmRpc:
             raise ExecutionError(f"{method}: {data['error']}")
         return data.get("result")
 
+    async def get_logs(self, filt: dict[str, Any]) -> list:
+        data = await self.call("eth_getLogs", [filt])
+        return data if isinstance(data, list) else []
+
     async def eth_call(self, to: str, data: str) -> str:
         return await self.call("eth_call", [{"to": to, "data": data}, "latest"])
 

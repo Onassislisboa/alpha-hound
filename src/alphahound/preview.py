@@ -12,8 +12,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-from .models import Chain, now_ms
+from .models import Chain, now_ms, describe_error, describe_exit
 from .playbook import max_age_minutes
 from .settings import Config, Settings, load_fomo, load_kols, save_fomo, save_kols
 from .store import Store
@@ -112,7 +113,9 @@ def _closed_book(store: Store) -> dict[str, Any]:
                 "pnl_usd": round(t.pnl_usd, 2),
                 "pnl_pct": round(t.pnl_pct, 4),
                 "exit": t.exit_reason.value,
+                "exit_why": describe_exit(t.exit_reason),
                 "klass": t.error_class.value,
+                "klass_why": describe_error(t.error_class),
                 "mfe": round(t.max_favorable_excursion, 4),
                 "hold_min": int(round((t.closed_at_ms - t.opened_at_ms) / 60_000)),
                 "closed_at_ms": t.closed_at_ms,
@@ -307,6 +310,14 @@ HTML = """<!doctype html>
   table.book .pnl { font-size: 16px; font-weight: 800; }
   table.book .mcap-path { font-size: 13px; color: #fff; font-weight: 600; }
   table.book th { position: sticky; top: 0; background: #000; z-index: 1; }
+  .rev-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 14px 20px 0; }
+  .rev-bar select { font: inherit; background: #111; color: #fff; border: 1px solid #2a2a2a; padding: 6px 8px; }
+  tr.rev-feat td { background: #0a0a0a; color: var(--text); font-size: 12px; }
+  .out-fumble { color: #ffd24a; }
+  .out-rejeicao_correta { color: #6a6a6a; }
+  .out-entrada_correta { color: #3ecf8e; }
+  .out-entrada_errada { color: #ff3b4e; }
+  .out-tracking { color: #5b8cff; }
   main { display: grid; grid-template-columns: 1fr 1fr; }
   main > section:first-child { grid-column: 1 / -1; }
   section { padding: 14px 20px; }
@@ -347,6 +358,7 @@ HTML = """<!doctype html>
   <button type="button" class="on" data-tab="tab-watch">scan</button>
   <button type="button" data-tab="tab-kols">kols</button>
   <button type="button" data-tab="tab-fomo">fomo</button>
+  <button type="button" data-tab="tab-review">review</button>
   <button type="button" data-tab="tab-pnl">pnl</button>
 </nav>
 <div id="tab-watch" class="panel on">
@@ -401,6 +413,25 @@ HTML = """<!doctype html>
   <section>
     <table id="fomo-rows"><thead><tr>
       <th>nome</th><th>chain</th><th>wallet</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+</div>
+<div id="tab-review" class="panel">
+  <div class="rev-bar">
+    <select id="rev-out">
+      <option value="">todos</option>
+      <option value="fumble">fumble</option>
+      <option value="rejeicao_correta">rejeição correta</option>
+      <option value="entrada_correta">entrada correta</option>
+      <option value="entrada_errada">entrada errada</option>
+      <option value="tracking">ainda tracking</option>
+    </select>
+    <span class="muted" id="rev-meta"></span>
+  </div>
+  <p class="muted" style="padding:8px 20px 0">MFE do shadow é o pico na janela, não o close. Dump e flat parecem iguais se não bombou. Clique a linha pras features.</p>
+  <section>
+    <table id="review" class="book"><thead><tr>
+      <th>quando</th><th>token</th><th>decisão</th><th>p / ev</th><th>resultado</th><th>outcome</th>
     </tr></thead><tbody></tbody></table>
   </section>
 </div>
@@ -812,6 +843,13 @@ document.addEventListener('click', e => {
   if (tab) {
     document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b === tab));
     document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === tab.dataset.tab));
+    if (tab.dataset.tab === 'tab-review') loadReview();
+    return;
+  }
+  const rev = e.target.closest('.rev-row');
+  if (rev) {
+    const feat = document.querySelector('[data-rev-feat="'+rev.dataset.rev+'"]');
+    if (feat) feat.hidden = !feat.hidden;
     return;
   }
   const pick = e.target.closest('[data-pick]');
@@ -990,12 +1028,45 @@ async function tick() {
     <td class="pnl ${cls(t.pnl_usd)}">${usd(t.pnl_usd)} <span class="muted">${pct(t.pnl_pct)}</span></td>
     <td class="mcap-path">${mcapPath(t.mcap_entry, t.mcap_exit)}</td>
     <td>${t.hold_min != null ? mins(t.hold_min) : '—'}</td>
-    <td class="muted">${t.exit}</td></tr>`, 'none closed', 6);
+    <td class="muted" title="${esc(t.exit_why||'')}">${t.exit}<div class="meta">${esc(t.exit_why||'')}</div></td></tr>`, 'none closed', 6);
   paintKols(d.kols);
   paintFomo(d.fomo);
   paintPnl(d.pnl_chart);
   inflight = false;
 }
+const OUT_LAB = {fumble:'fumble', rejeicao_correta:'rejeição correta', entrada_correta:'entrada correta',
+  entrada_errada:'entrada errada', tracking:'tracking'};
+const when = ms => new Date(ms).toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+let revBusy = false;
+async function loadReview() {
+  if (revBusy) return;
+  revBusy = true;
+  const out = $('rev-out').value;
+  try {
+    const j = await (await fetch('/api/review?outcome='+encodeURIComponent(out)+'&limit=250', {cache:'no-store'})).json();
+    $('rev-meta').textContent = (j.open_rows||0)+' shadows abertos · '+(j.open_keys||0)+' tokens no lote de 30 · fumble ≥ '+Math.round((j.fumble_pct||0.2)*100)+'% MFE';
+    const body = (j.rows||[]).map((r,i) => {
+      const ca = (r.key||'').split(':')[1]||'';
+      const res = r.action==='enter'
+        ? (usd(r.pnl_usd)+' · '+(r.error_class||''))
+        : (r.mfe==null ? '—' : pct(r.mfe));
+      const feat = (r.contrib||[]).map(kv => kv[0]+' '+(kv[1]>=0?'+':'')+Number(kv[1]).toFixed(2)).join(' · ') || '—';
+      const why = [r.exit_why, r.error_why, r.reason_why].filter((s,i,a) => s && a.indexOf(s)===i).join(' · ');
+      return `<tr class="rev-row" data-rev="${i}"><td>${when(r.ts_ms)}</td>
+        <td><div class="sym">${esc(r.symbol||caHead(ca))}</div><div class="ca">${chainShort(r.chain||'')} ${esc(caHead(ca))}</div></td>
+        <td>${esc(r.action)}<div class="meta">${esc(r.reason||'')}</div></td>
+        <td>${pct(r.p)} / ${pct(r.ev)}</td>
+        <td>${res}</td>
+        <td class="out-${esc(r.outcome)}">${OUT_LAB[r.outcome]||r.outcome}</td></tr>
+        <tr class="rev-feat" data-rev-feat="${i}" hidden><td colspan="6">${esc(why ? why+' · ' : '')}${esc(feat)}</td></tr>`;
+    }).join('') || '<tr><td colspan="6" class="muted">vazio</td></tr>';
+    $('review').querySelector('tbody').innerHTML = body;
+  } catch (err) {
+    $('rev-meta').textContent = 'falhou o review';
+  }
+  revBusy = false;
+}
+$('rev-out').addEventListener('change', loadReview);
 tick();
 setInterval(tick, 400);
 </script>
@@ -1022,7 +1093,30 @@ def serve(
             return
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path.split("?", 1)[0] == "/api":
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/review":
+                q = parse_qs(parsed.query)
+                try:
+                    payload = store.review_history(
+                        outcome=(q.get("outcome") or [""])[0],
+                        fumble_pct=float((q.get("fumble") or ["0.20"])[0] or 0.20),
+                        limit=int((q.get("limit") or ["250"])[0] or 250),
+                    )
+                    body = json.dumps(payload).encode()
+                except Exception as exc:  # noqa: BLE001
+                    body = json.dumps({"error": str(exc)}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path == "/api":
                 try:
                     body = snapshot()
                 except Exception as exc:  # noqa: BLE001

@@ -27,7 +27,15 @@ from ..playbook import copy_signal as copy_flag
 from ..settings import Config, crowd_addresses, whale_addresses
 from ..store import Store
 from . import chart, flow, terminals, whales
-from .distribution import Holder, HolderStats, analyze, holder_growth
+from .distribution import (
+    TRANSFER_TOPIC0,
+    Holder,
+    HolderStats,
+    analyze,
+    decode_transfer_log,
+    holder_growth,
+    holders_from_moves,
+)
 from .terminals import Attribution, ShareTracker, TerminalRegistry
 from .whales import who_inside
 
@@ -48,6 +56,7 @@ class Enrichment:
     candidate: Candidate
     features: Features
     holders: HolderStats = field(default_factory=HolderStats)
+    chain_probed: bool = False
     mint: MintInfo | None = None
     attribution: Attribution = field(default_factory=Attribution)
     round_trip: RoundTrip = field(default_factory=lambda: RoundTrip(ok=False, note="not probed"))
@@ -233,10 +242,76 @@ class Enricher:
         self, candidate: Candidate, result: Enrichment
     ) -> dict[str, float]:
         if candidate.chain is Chain.SOLANA and self.solana is not None:
-            return await self._solana_features(candidate, result)
+            values = await self._solana_features(candidate, result)
+            result.chain_probed = True
+            return values
         values = self._aggregate_only_features(candidate, result)
+        values.update(await self._evm_launch_distribution(candidate, result))
         values.update(await self._evm_labeled_crowd(candidate, result))
+        result.chain_probed = True
         return values
+
+    async def _evm_launch_distribution(
+        self, candidate: Candidate, result: Enrichment
+    ) -> dict[str, float]:
+        """Launch bundle + token-source cluster from ERC-20 Transfer logs."""
+        rpc = self.evm_rpcs.get(candidate.chain)
+        if rpc is None or not candidate.address:
+            return {}
+        lookback = int(self.strategy.get("gates.bundle_log_lookback_blocks", 40_000))
+        first_n = int(self.strategy.get("gates.bundle_first_n", 40))
+        window = int(self.strategy.get("gates.bundle_slot_window", 3))
+        try:
+            latest = int(await rpc.call("eth_blockNumber", []), 16)
+            start = max(0, latest - lookback)
+            raw = await rpc.get_logs(
+                {
+                    "fromBlock": hex(start),
+                    "toBlock": hex(latest),
+                    "address": candidate.address,
+                    "topics": [TRANSFER_TOPIC0],
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            result.notes.append(f"transfer logs failed: {exc}")
+            return {}
+        moves = [m for m in (decode_transfer_log(x) for x in raw) if m]
+        if not moves:
+            result.notes.append("transfer logs empty in lookback")
+            return {}
+        pools = {candidate.pool_address.lower()} if candidate.pool_address else set()
+        holders, launch = holders_from_moves(
+            moves, pools=pools, deployer=candidate.deployer, first_n=first_n
+        )
+        if not holders:
+            return {}
+        stats = analyze(holders, now_ms=now_ms(), launch_slot=launch, bundle_slot_window=window)
+        result.holders = stats
+        for key in (
+            "bundle_pct",
+            "cluster_pct",
+            "top10_pct",
+            "top1_pct",
+            "gini",
+            "dev_holding_pct",
+            "fresh_wallet_pct",
+            "holder_count",
+        ):
+            result.unknown.discard(key)
+        result.notes.append(
+            f"evm dist: bundle {stats.bundle_pct:.0%} cluster {stats.largest_funding_cluster_pct:.0%} "
+            f"n={stats.holder_count}"
+        )
+        return {
+            "holder_count": float(stats.holder_count),
+            "top10_pct": stats.top10_pct,
+            "top1_pct": stats.top1_pct,
+            "gini": stats.gini,
+            "fresh_wallet_pct": stats.fresh_wallet_pct,
+            "bundle_pct": stats.bundle_pct,
+            "dev_holding_pct": stats.dev_holding_pct,
+            "cluster_pct": stats.largest_funding_cluster_pct,
+        }
 
     async def _solana_features(
         self, candidate: Candidate, result: Enrichment

@@ -5,9 +5,10 @@ positions an hour does not justify a database server, and a single .db file is
 the difference between "I can inspect last Tuesday" and "the logs rotated".
 
 The one non-obvious table is `shadow`: every REJECTED candidate is tracked for
-an hour so the counterfactual PnL of our own filters is measurable. A bot that
-only records trades it took can never discover that its gates are too tight -
-it will just get quieter and quieter and call that discipline.
+`learning.shadow_track_minutes` so the counterfactual PnL of our own filters is
+measurable. A bot that only records trades it took can never discover that its
+gates are too tight - it will just get quieter and quieter and call that
+discipline.
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ from .models import (
     Features,
     TradeRecord,
     VenueId,
+    describe_code,
+    describe_error,
+    describe_exit,
     now_ms,
 )
 
@@ -289,6 +293,129 @@ class Store:
                ORDER BY s.counterfactual_pct DESC LIMIT ?""",
             (limit,),
         ).fetchall()
+
+    def review_history(
+        self,
+        *,
+        outcome: str = "",
+        fumble_pct: float = 0.20,
+        limit: int = 250,
+    ) -> dict[str, Any]:
+        """Decisions + shadow MFE + closed trades, classified for the visor.
+
+        One row per reject decision (or closed trade). Does not write. Unresolved
+        shadows are omitted unless outcome=tracking — they are not 'correct rejects'.
+        """
+        outcome = (outcome or "").strip().lower()
+        fumble_pct = float(fumble_pct)
+        limit = max(1, min(int(limit), 1000))
+        open_n, open_keys = self.conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT key) FROM shadow WHERE resolved = 0"
+        ).fetchone()
+
+        def contribs(raw: str) -> list[list]:
+            try:
+                data = json.loads(raw or "{}")
+            except ValueError:
+                return []
+            if not isinstance(data, dict):
+                return []
+            items = [(str(k), float(v)) for k, v in data.items() if not str(k).startswith("_")]
+            items.sort(key=lambda kv: -abs(kv[1]))
+            return [[k, round(v, 4)] for k, v in items[:24]]
+
+        rows: list[dict[str, Any]] = []
+        want_rej = outcome in ("", "fumble", "rejeicao_correta", "tracking")
+        want_ent = outcome in ("", "entrada_correta", "entrada_errada")
+
+        if want_rej:
+            sql = """SELECT d.ts_ms, d.key, d.symbol, d.chain, d.action, d.reason,
+                            d.probability, d.expected_value, d.contributions,
+                            s.resolved, s.counterfactual_pct
+                     FROM decisions d JOIN shadow s ON s.decision_id = d.id"""
+            params: list[Any] = []
+            if outcome == "fumble":
+                sql += " WHERE s.resolved = 1 AND IFNULL(s.counterfactual_pct, 0) >= ?"
+                params.append(fumble_pct)
+            elif outcome == "rejeicao_correta":
+                sql += " WHERE s.resolved = 1 AND IFNULL(s.counterfactual_pct, 0) < ?"
+                params.append(fumble_pct)
+            elif outcome == "tracking":
+                sql += " WHERE s.resolved = 0"
+            else:
+                sql += " WHERE s.resolved = 1"
+            sql += " ORDER BY d.ts_ms DESC LIMIT ?"
+            params.append(limit)
+            for r in self.conn.execute(sql, params):
+                cf = float(r["counterfactual_pct"] or 0.0)
+                resolved = int(r["resolved"] or 0)
+                if resolved:
+                    kind = "fumble" if cf >= fumble_pct else "rejeicao_correta"
+                else:
+                    kind = "tracking"
+                rows.append(
+                    {
+                        "ts_ms": int(r["ts_ms"]),
+                        "key": r["key"],
+                        "symbol": r["symbol"] or "",
+                        "chain": r["chain"],
+                        "action": r["action"],
+                        "reason": r["reason"] or "",
+                        "reason_why": describe_code(r["reason"] or ""),
+                        "p": round(float(r["probability"] or 0.0), 4),
+                        "ev": round(float(r["expected_value"] or 0.0), 4),
+                        "mfe": round(cf, 4) if resolved else None,
+                        "error_class": "",
+                        "pnl_usd": None,
+                        "outcome": kind,
+                        "contrib": contribs(r["contributions"]),
+                    }
+                )
+
+        if want_ent:
+            enters: dict[str, sqlite3.Row] = {}
+            for r in self.conn.execute(
+                """SELECT key, probability, expected_value, contributions, reason, ts_ms
+                   FROM decisions WHERE action = 'enter' ORDER BY ts_ms"""
+            ):
+                enters[r["key"]] = r
+            for t in self.trades(limit=limit):
+                kind = "entrada_correta" if t.pnl_usd > 0 else "entrada_errada"
+                if outcome and kind != outcome:
+                    continue
+                d = enters.get(t.key)
+                rows.append(
+                    {
+                        "ts_ms": int(t.closed_at_ms),
+                        "key": t.key,
+                        "symbol": t.symbol or "",
+                        "chain": t.chain.value,
+                        "action": "enter",
+                        "reason": (d["reason"] if d else "") or t.exit_reason.value,
+                        "reason_why": describe_code(
+                            t.exit_reason.value
+                            or (d["reason"] if d else "")
+                            or t.error_class.value
+                        ),
+                        "exit_why": describe_exit(t.exit_reason),
+                        "error_why": describe_error(t.error_class),
+                        "p": round(float(d["probability"] if d else 0.0), 4),
+                        "ev": round(float(d["expected_value"] if d else 0.0), 4),
+                        "mfe": round(float(t.max_favorable_excursion or 0.0), 4),
+                        "error_class": t.error_class.value,
+                        "pnl_usd": round(float(t.pnl_usd), 2),
+                        "outcome": kind,
+                        "contrib": contribs(d["contributions"] if d else "{}"),
+                    }
+                )
+
+        rows.sort(key=lambda x: -x["ts_ms"])
+        return {
+            "rows": rows[:limit],
+            "fumble_pct": fumble_pct,
+            "open_rows": int(open_n or 0),
+            "open_keys": int(open_keys or 0),
+        }
 
     # -- trades ------------------------------------------------------------
     def record_trade(self, trade: TradeRecord) -> int:

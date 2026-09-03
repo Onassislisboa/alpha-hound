@@ -59,9 +59,18 @@ max_transfer_tax_pct = 0.05
 # Fraction of holders that are wallets less than 24h old. High values mean the
 # holder count is manufactured.
 max_fresh_wallet_pct = 0.70
-# Fraction of supply held by wallets that bought in the launch slot. These are
-# competing bots with a lower cost basis who will exit into your buy.
-max_bundle_pct = 0.25
+# Fraction of supply held by wallets that bought in the launch slot/block
+# window. Hard veto (not a score weight). Competing bots with a lower cost basis.
+max_bundle_pct = 0.20
+# Linked supply (one-hop token funder or Bubblemaps). Same treatment as bundle.
+# 0 disables. Playbooks can tighten per chain.
+max_cluster_pct = 0.20
+# ERC-20 Transfer lookback when measuring EVM bundle/cluster (blocks).
+bundle_log_lookback_blocks = 40000
+# Only stamp token-funder on the first N unique recipients.
+bundle_first_n = 40
+# Same-block/slot window around launch for bundle_pct.
+bundle_slot_window = 3
 # One UNKNOWN wallet holding this much circulating supply is a rug. A known
 # KOL/whale holding the same share (the $TRUMP *shape* on a fresh launch) is
 # not vetoed — it still scores as concentrated, so size stays small.
@@ -323,8 +332,9 @@ promotion_margin = 0.01
 rollback_window_trades = 20
 # Rejected candidates are shadow-tracked for this long to measure what our
 # filters cost us. Without this the model only ever learns from trades it
-# already agreed with.
-shadow_track_minutes = 60
+# already agreed with. 180 min is when runners tend to confirm; Dexscreener
+# poll is capped at 30 open rows per risk tick so this is not 3x API load.
+shadow_track_minutes = 180
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +347,7 @@ max_age_minutes = 45
 copy_max_age_minutes = 30
 copy_min_mcap_usd = 100000
 copy_max_mcap_usd = 2000000
-max_cluster_pct = 0.28
+max_cluster_pct = 0.20
 max_unknown_top1_pct = 0.28
 max_bundle_pct = 0.18
 # KOL/whale is a boost, not a gate, until the lists are filled.
@@ -355,7 +365,8 @@ max_age_minutes = 180
 copy_max_age_minutes = 90
 copy_min_mcap_usd = 100000
 copy_max_mcap_usd = 2000000
-max_cluster_pct = 0.40
+max_cluster_pct = 0.20
+max_bundle_pct = 0.20
 min_volume_5m = 5000
 min_twitter_mentions = 2
 max_chase_ret_5m = 0.12

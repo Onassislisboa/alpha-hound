@@ -119,6 +119,20 @@ class TestDistribution(unittest.TestCase):
         stats = analyze(holders, now_ms=now_ms())
         self.assertGreater(stats.largest_funding_cluster_pct, 0.85)
 
+    def test_token_hops_from_one_sender_are_a_funding_cluster(self):
+        from alphahound.signals.distribution import TokenMove, holders_from_moves
+
+        pool = "0x" + "p" * 40
+        src = "0x" + "a" * 40
+        moves = [
+            TokenMove(1, src, f"0x{i:040x}", 10.0) for i in range(1, 9)
+        ] + [TokenMove(2, pool, "0x" + "b" * 40, 5.0)]
+        holders, launch = holders_from_moves(moves, pools={pool}, first_n=40)
+        self.assertEqual(launch, 1)
+        stats = analyze(holders, now_ms=now_ms(), launch_slot=launch)
+        self.assertGreater(stats.largest_funding_cluster_pct, 0.70)
+        self.assertGreater(stats.bundle_pct, 0.70)
+
     def test_bundle_pct_not_reported_without_a_launch_slot(self):
         holders = [Holder("a", 100.0, acquired_slot=10)]
         stats = analyze(holders, now_ms=now_ms(), launch_slot=0)
@@ -554,7 +568,7 @@ class TestGates(unittest.TestCase):
         enr.candidate.dex_id = "pons"
         enr.candidate.address = "0xabc"
         hood, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
-        self.assertFalse(any("rug_filter" in v for v in hood), hood)
+        self.assertTrue(any("rug_filter" in v for v in hood), hood)
 
     def test_paid_listing_skips_unmeasured_cluster(self):
         enr = self.enrichment()
@@ -570,6 +584,12 @@ class TestGates(unittest.TestCase):
         enr.mint = _FakeMint(None, None)
         vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=True)
         self.assertTrue(any("cluster:" in v for v in vetoes), vetoes)
+
+    def test_measured_bundle_is_a_hard_veto(self):
+        enr = self.enrichment(bundle_pct=0.45)
+        enr.mint = _FakeMint(None, None)
+        vetoes, _ = evaluate_gates(enr, STRATEGY, self.store, live=False)
+        self.assertTrue(any(v.startswith("bundle:") for v in vetoes), vetoes)
 
     def test_robinhood_age_is_not_an_entry_veto(self):
         enr = self.enrichment()
@@ -988,6 +1008,57 @@ class TestSelfTuning(unittest.TestCase):
             self.store.param("gates.min_liquidity_usd", 0.0),
             float(STRATEGY["gates.min_liquidity_usd"]),
         )
+
+
+class TestReviewHistory(unittest.TestCase):
+    def setUp(self):
+        self.store, self._tmp = make_store()
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_review_splits_fumble_from_correct_reject_and_entries(self):
+        from alphahound.models import Score
+
+        miss = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="dead", price_usd=1.0, symbol="DEAD"),
+            features=Features(),
+            score=Score(probability=0.3, expected_value=0.0, contributions={"retail_share": -0.5}),
+            action=Action.REJECT_GATE,
+            reason="liquidity: thin",
+        )
+        win_rej = Decision(
+            candidate=Candidate(chain=Chain.SOLANA, address="run", price_usd=1.0, symbol="RUN"),
+            features=Features(),
+            score=Score(probability=0.4, expected_value=0.01, contributions={"copy_signal": 0.9}),
+            action=Action.REJECT_SCORE,
+            reason="score: p 0.40 < 0.42",
+        )
+        self.store.resolve_shadow(self.store.record_decision(miss), 0.05)
+        self.store.resolve_shadow(self.store.record_decision(win_rej), 0.80)
+        self.store.record_trade(_trade(pnl=12.0, error_class=ErrorClass.WIN))
+        self.store.record_trade(_trade(pnl=-8.0, error_class=ErrorClass.NO_EDGE))
+
+        all_rows = {r["outcome"] for r in self.store.review_history()["rows"]}
+        self.assertEqual(
+            all_rows,
+            {"rejeicao_correta", "fumble", "entrada_correta", "entrada_errada"},
+        )
+        fumbles = self.store.review_history(outcome="fumble")["rows"]
+        self.assertEqual(len(fumbles), 1)
+        self.assertEqual(fumbles[0]["symbol"], "RUN")
+        self.assertEqual(fumbles[0]["contrib"][0][0], "copy_signal")
+
+
+class TestExitCopy(unittest.TestCase):
+    def test_exit_and_gate_copy_match_known_codes(self):
+        from alphahound.models import describe_code, describe_exit
+
+        self.assertIn("stop duro", describe_exit("stop_loss"))
+        self.assertIn("funding", describe_code("cluster: 44% linked supply"))
+        self.assertIn("esfriou", describe_code("no_edge"))
+
 
 
 class TestBacktest(unittest.TestCase):
@@ -1438,7 +1509,7 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(read.label, "cabaled")
         self.assertEqual(read.risk, 0)
         self.assertIsNotNone(bot_veto(read, "solana"))
-        self.assertIsNone(bot_veto(read, "robinhood_chain"))
+        self.assertIsNotNone(bot_veto(read, "robinhood_chain"))
 
     def test_organic_is_not_a_buy(self):
         from alphahound.verdict import bot_veto, classify
