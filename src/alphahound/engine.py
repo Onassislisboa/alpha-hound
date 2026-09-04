@@ -69,6 +69,26 @@ from .verdict import security_cert
 
 log = get("engine")
 
+# RPC/network may fail a pass. These mean the code itself is wrong — retrying
+# forever looks "alive" on the visor while scan is frozen (NameError mcap_is_dead).
+LOOP_BUGS = (
+    NameError,
+    AttributeError,
+    TypeError,
+    SyntaxError,
+    ImportError,
+    IndentationError,
+)
+
+
+def loop_bug(exc: BaseException) -> bool:
+    return isinstance(exc, LOOP_BUGS)
+
+
+def enrich_due(last_scored_ms: int, now: int, ttl_ms: int) -> bool:
+    """First look always; afterwards wait ttl so RPC isn't spent re-reading the same mint."""
+    return last_scored_ms <= 0 or ttl_ms <= 0 or now - last_scored_ms >= ttl_ms
+
 
 def mcap_is_dead(mcap_usd: float, floor: float) -> bool:
     return floor > 0 and 0 < mcap_usd < floor
@@ -174,6 +194,8 @@ class Engine:
         self._reads: dict[str, dict] = {}
         self._inflight: set[str] = set()
         self._stop = asyncio.Event()
+        self._loop_faults: dict[str, str] = {}
+        self._loop_dead: set[str] = set()
         self._load_positions()
 
     # -- lifecycle ---------------------------------------------------------
@@ -215,19 +237,36 @@ class Engine:
                 "Run `alphahound discover-terminals` to populate them."
             )
 
+        self._assert_loop_helpers()
         await self.discovery.start()
         try:
             await asyncio.gather(self._risk_loop(), self._scan_loop(), self._quote_loop())
         finally:
             await self.shutdown()
 
+    def _assert_loop_helpers(self) -> None:
+        if not mcap_is_dead(1.0, 40_000) or mcap_is_dead(0.0, 40_000):
+            raise RuntimeError("mcap_is_dead helper is broken")
+        if not enrich_due(0, 1, 15_000):
+            raise RuntimeError("enrich_due helper is broken")
+
     async def _every(self, seconds: float, body, label: str) -> None:
         while not self._stop.is_set():
             started = now_ms()
             try:
                 await body()
-            except Exception:  # noqa: BLE001 - a bad pass must not kill the bot
+                self._loop_faults.pop(label, None)
+            except Exception as exc:  # noqa: BLE001
                 log.exception(f"{label} failed")
+                self._loop_faults[label] = f"{type(exc).__name__}: {exc}"[:240]
+                self._write_preview()
+                if loop_bug(exc):
+                    self._loop_dead.add(label)
+                    log.error(
+                        "loop dead",
+                        extra={"loop": label, "error": self._loop_faults[label]},
+                    )
+                    return
             elapsed = (now_ms() - started) / 1000.0
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=max(0.1, seconds - elapsed))
@@ -261,7 +300,6 @@ class Engine:
     async def _scan_loop(self) -> None:
         async def body() -> None:
             self.enricher.whale_rows = chase_rows(self.settings.state_dir)
-            self.enricher._smart_cache.clear()
             self._drain_inspect()
             found = await self.discovery.poll()
             before = set(self.watching)
@@ -391,6 +429,8 @@ class Engine:
                 "best_probability": round(self._best_probability, 3),
                 "tick": dict(self._tick_counts),
                 "holds": holds,
+                "faults": dict(self._loop_faults),
+                "dead_loops": sorted(self._loop_dead),
             },
         )
 
@@ -416,6 +456,7 @@ class Engine:
                 "equity_usd": round(self.risk.equity(), 2),
                 "since_last": dict(self._tick_counts),
                 "best_probability": round(self._best_probability, 3),
+                "dead_loops": sorted(self._loop_dead),
             },
         )
         self._tick_counts.clear()
@@ -662,12 +703,14 @@ class Engine:
             return (unseen, 0 if c.dex_paid else 1, stale, vol)
 
         # Every visor card gets a note. Halt only blocks the fill, not the grade.
+        ttl_ms = int(float(self.strategy.get("loop.rescore_seconds", 15)) * 1000)
         ranked = [
             c
             for c in sorted(self.watching.values(), key=_attention)
             if c.key not in self.positions
             and c.key not in self._inflight
             and self.router.has_venue(c.chain)
+            and (c.source == "inspect" or enrich_due(c.last_scored_ms, now, ttl_ms))
         ]
 
         probe_size = max(

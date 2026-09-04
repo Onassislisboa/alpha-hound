@@ -19,6 +19,7 @@ from .engine import Engine, build_registry
 from .models import Chain
 from .net import Http
 from .playbook import gate as pb_gate
+from .preview import read_preview
 from .providers import Dexscreener
 from .risk import RiskEngine
 from .scoring import Model
@@ -141,6 +142,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     engaged = store.get_kv("kill_switch") == "1"
     print(f"  kill switch       {'ENGAGED - ' + store.get_kv('kill_switch_reason') if engaged else 'clear'}")
+    live = read_preview(settings.state_dir)
+    dead = live.get("dead_loops") or []
+    if dead:
+        print(f"  loop faults       DEAD {', '.join(dead)} {live.get('faults')}")
 
     labels = registry.attributable_labels
     print(

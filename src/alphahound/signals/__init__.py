@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ..log import get
 from ..models import Candidate, Candle, Chain, Features, RoundTrip, now_ms
@@ -111,6 +111,8 @@ class Enricher:
         self._holder_history: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._launch_slots: dict[str, int] = {}
         self._smart_cache: dict[Chain, set[str]] = {}
+        self._whale_fp: tuple[str, ...] | None = None
+        self._evm_cache: dict[str, tuple[int, dict[str, Any]]] = {}
 
     # -- public ------------------------------------------------------------
     async def refresh(self, candidate: Candidate) -> PairSnapshot | None:
@@ -251,6 +253,16 @@ class Enricher:
         result.chain_probed = True
         return values
 
+    def _evm_cached(self, key: str) -> dict[str, Any] | None:
+        hit = self._evm_cache.get(key)
+        if hit is None or hit[0] <= now_ms():
+            return None
+        return hit[1]
+
+    def _evm_put(self, key: str, payload: dict[str, Any]) -> None:
+        ttl = int(float(self.strategy.get("gates.bundle_cache_seconds", 60)) * 1000)
+        self._evm_cache[key] = (now_ms() + max(0, ttl), payload)
+
     async def _evm_launch_distribution(
         self, candidate: Candidate, result: Enrichment
     ) -> dict[str, float]:
@@ -258,6 +270,25 @@ class Enricher:
         rpc = self.evm_rpcs.get(candidate.chain)
         if rpc is None or not candidate.address:
             return {}
+        cached = self._evm_cached(f"dist:{candidate.key}")
+        if cached is not None:
+            stats = cached.get("stats")
+            if stats is not None:
+                result.holders = stats
+            for key in (
+                "bundle_pct",
+                "cluster_pct",
+                "top10_pct",
+                "top1_pct",
+                "gini",
+                "dev_holding_pct",
+                "fresh_wallet_pct",
+                "holder_count",
+            ):
+                result.unknown.discard(key)
+            if cached.get("note"):
+                result.notes.append(str(cached["note"]))
+            return dict(cached.get("values") or {})
         lookback = int(self.strategy.get("gates.bundle_log_lookback_blocks", 40_000))
         first_n = int(self.strategy.get("gates.bundle_first_n", 40))
         window = int(self.strategy.get("gates.bundle_slot_window", 3))
@@ -302,7 +333,7 @@ class Enricher:
             f"evm dist: bundle {stats.bundle_pct:.0%} cluster {stats.largest_funding_cluster_pct:.0%} "
             f"n={stats.holder_count}"
         )
-        return {
+        values = {
             "holder_count": float(stats.holder_count),
             "top10_pct": stats.top10_pct,
             "top1_pct": stats.top1_pct,
@@ -312,6 +343,11 @@ class Enricher:
             "dev_holding_pct": stats.dev_holding_pct,
             "cluster_pct": stats.largest_funding_cluster_pct,
         }
+        self._evm_put(
+            f"dist:{candidate.key}",
+            {"values": values, "stats": stats, "note": result.notes[-1]},
+        )
+        return values
 
     async def _solana_features(
         self, candidate: Candidate, result: Enrichment
@@ -467,6 +503,10 @@ class Enricher:
         return values
 
     def _known_wallets(self, chain: Chain) -> set[str]:
+        fp = tuple(sorted(str(r.get("address") or "") for r in self.whale_rows))
+        if fp != self._whale_fp:
+            self._smart_cache.clear()
+            self._whale_fp = fp
         cached = self._smart_cache.get(chain)
         if cached is not None:
             return cached
@@ -688,6 +728,15 @@ class Enricher:
                 f"{candidate.chain.value}: KOL check skipped ({'no rpc' if rpc is None else 'no labeled evm wallets'})"
             )
             return {}
+        cached = self._evm_cached(f"crowd:{candidate.key}")
+        if cached is not None:
+            if cached.get("crowd"):
+                result.crowd = dict(cached["crowd"])
+            result.unknown.discard("fomo_inside")
+            result.unknown.update({"whale_hold_pct", "whale_net_flow", "fomo_net_flow"})
+            if cached.get("note"):
+                result.notes.append(str(cached["note"]))
+            return dict(cached.get("values") or {})
 
         async def one(addr: str):
             try:
@@ -710,6 +759,14 @@ class Enricher:
         result.unknown.update({"whale_hold_pct", "whale_net_flow", "fomo_net_flow"})
         result.notes.append(
             f"labeled holders: {len(holders)}/{len(addrs)} KOL/fomo wallets have a bag"
+        )
+        self._evm_put(
+            f"crowd:{candidate.key}",
+            {
+                "values": extra,
+                "crowd": dict(result.crowd or {}),
+                "note": result.notes[-1],
+            },
         )
         return extra
 
@@ -734,3 +791,5 @@ class Enricher:
     def forget(self, key: str) -> None:
         self.shares.forget(key)
         self._holder_history.pop(key, None)
+        self._evm_cache.pop(f"dist:{key}", None)
+        self._evm_cache.pop(f"crowd:{key}", None)

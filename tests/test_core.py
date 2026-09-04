@@ -38,6 +38,7 @@ from alphahound.models import (  # noqa: E402
     VenueId,
     now_ms,
 )
+from alphahound.engine import enrich_due, loop_bug  # noqa: E402
 from alphahound.portfolio import PositionManager, banked_from_peak  # noqa: E402
 from alphahound.risk import RiskEngine, kelly_fraction, mcap_position_pct  # noqa: E402
 from alphahound.scoring import (  # noqa: E402
@@ -63,6 +64,23 @@ from alphahound.signals.terminals import (  # noqa: E402
 from alphahound.store import Store, lock_state_dir  # noqa: E402
 
 STRATEGY = load_strategy()
+
+
+class TestEnrichDue(unittest.TestCase):
+    def test_first_look_always_runs(self):
+        self.assertTrue(enrich_due(0, 10_000, 15_000))
+
+    def test_skips_until_ttl(self):
+        self.assertFalse(enrich_due(1_000, 10_000, 15_000))
+        self.assertTrue(enrich_due(1_000, 20_000, 15_000))
+
+
+class TestLoopBug(unittest.TestCase):
+    def test_name_error_is_fatal_timeout_is_not(self):
+        self.assertTrue(loop_bug(NameError("mcap_is_dead")))
+        self.assertTrue(loop_bug(AttributeError("x")))
+        self.assertFalse(loop_bug(RuntimeError("rpc 429")))
+        self.assertFalse(loop_bug(TimeoutError()))
 
 
 def make_store() -> tuple[Store, tempfile.TemporaryDirectory]:

@@ -25,6 +25,8 @@ enrich_concurrency = 4
 # Discovery dumps hundreds of pairs. Cap the visor and skip the rest; vamps
 # drop first, mains stay. Unseen names rotate in next scan.
 max_watching = 40
+# Full enrich this often. Quotes still tick; new coins jump the queue.
+rescore_seconds = 15
 # Below this the coin is dead. Drop from visor, no enrich/score/sqlite.
 dead_mcap_usd = 40000
 # Proof of life, with a breakdown of what rejected everything. 0 disables.
@@ -71,6 +73,8 @@ bundle_log_lookback_blocks = 40000
 bundle_first_n = 40
 # Same-block/slot window around launch for bundle_pct.
 bundle_slot_window = 3
+# Reuse launch logs / labeled balances this long. Bundle is a launch fact.
+bundle_cache_seconds = 60
 # One UNKNOWN wallet holding this much circulating supply is a rug. A known
 # KOL/whale holding the same share (the $TRUMP *shape* on a fresh launch) is
 # not vetoed — it still scores as concentrated, so size stays small.

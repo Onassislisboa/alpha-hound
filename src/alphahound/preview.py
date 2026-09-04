@@ -204,6 +204,8 @@ def assemble(
         "aggressive_closes": aggressive_closes_since_on(store) if strategy else 0,
         "min_p": score_floors(strategy, store)[0] if strategy else None,
         "min_ev": score_floors(strategy, store)[1] if strategy else None,
+        "faults": live.get("faults") or {},
+        "dead_loops": live.get("dead_loops") or [],
     }
 
 
@@ -351,6 +353,9 @@ HTML = """<!doctype html>
   .card h2 { margin: 0 0 6px; font-size: 13px; color: var(--hi); font-weight: 600; }
   .card p { margin: 0 0 5px; font-size: 12px; color: var(--muted); }
   .addr { font-size: 11px; color: var(--text); word-break: break-all; }
+  #fault { display: none; padding: 8px 20px; background: #2a0008; color: #ff6b7a;
+           border-bottom: 1px solid #ff3b4e; font-size: 12px; }
+  #fault.on { display: block; }
   @media (max-width: 900px) {
     main, .grid { grid-template-columns: 1fr; }
     section + section { border-left: 0; border-top: 1px solid var(--line); }
@@ -370,6 +375,7 @@ HTML = """<!doctype html>
   <div><h1>holding</h1><div class="n gold" id="holding">—</div></div>
   <div><h1>scanning</h1><div class="n cyan" id="watching">—</div></div>
 </header>
+<div id="fault"></div>
 <div id="verdict" class="verdict wait"><span class="tag">WAITING</span><span class="muted" id="verdict-h">sem trades ainda</span></div>
 <nav class="tabs">
   <button type="button" class="on" data-tab="tab-watch">scan</button>
@@ -1018,7 +1024,13 @@ async function tick() {
   const live = d.running ? (d.mode || 'run') : 'stopped';
   const halt = d.halted ? (' · paused ' + (d.halt_reason || '')) : '';
   const learn = d.aggressive ? (' · aggressive ' + (d.aggressive_closes||0) + ' closes') : '';
-  $('status').textContent = live + halt + learn + ' · ' + d.stale_s + 's';
+  const dead = (d.dead_loops || []).length ? (' · loop dead ' + d.dead_loops.join(',')) : '';
+  $('status').textContent = live + halt + learn + dead + ' · ' + d.stale_s + 's';
+  $('status').className = (d.dead_loops || []).length ? 'dn' : 'muted';
+  const fault = $('fault');
+  const msgs = Object.entries(d.faults || {}).map(([k,v]) => k + ': ' + v);
+  if (msgs.length) { fault.textContent = msgs.join(' · '); fault.className = 'on'; }
+  else { fault.textContent = ''; fault.className = ''; }
   setText('equity', usd(d.equity_usd), 'n');
   setText('pnl', usd(d.pnl), 'n '+cls(d.pnl));
   setText('winrate', d.win_rate == null ? '—' : Math.round(d.win_rate*100)+'%',
