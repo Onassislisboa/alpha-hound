@@ -267,6 +267,8 @@ class Features:
     # that crowd is still buying. Not an execution venue.
     fomo_inside: float = 0.0
     fomo_net_flow: float = 0.0
+    # Circulating share held by labeled Fomo wallets. Score boost, never a veto.
+    fomo_supply_pct: float = 0.0
     # Moby-style key holders: % of supply and buy-vs-sell of wallets that are
     # either labeled whales or large enough to count as one.
     whale_hold_pct: float = 0.0

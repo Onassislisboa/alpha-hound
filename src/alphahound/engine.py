@@ -229,6 +229,11 @@ class Engine:
                     self.strategy.get("risk.max_concurrent_positions", 1)
                 ),
                 "aggressive_learning": bool(self.strategy.get("aggressive_learning._active")),
+                "quote_cluster_hops": 2,
+                "fresh_unmeasured_neutral": True,
+                "max_candidate_age_minutes": int(
+                    float(self.strategy.get("loop.max_candidate_age_minutes", 180))
+                ),
             },
         )
         if not self.registry.attributable_labels:

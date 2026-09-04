@@ -59,6 +59,10 @@ def _topic_addr(topic: str) -> str:
     return ("0x" + t[-40:]) if len(t) >= 40 else ""
 
 
+def log_topic_addr(address: str) -> str:
+    return "0x" + address.lower().replace("0x", "").rjust(64, "0")
+
+
 def decode_transfer_log(raw: dict) -> TokenMove | None:
     topics = raw.get("topics") or []
     if len(topics) < 3 or str(topics[0]).lower() != TRANSFER_TOPIC0:
@@ -124,6 +128,55 @@ def holders_from_moves(
             )
         )
     return holders, launch
+
+
+def first_pool_buyers(
+    moves: list[TokenMove],
+    pools: set[str],
+    n: int,
+    balances: dict[str, float] | None = None,
+) -> list[str]:
+    """Pool buyers to probe for quote-token funding (cap n).
+
+    Time-ordered first inbound from the pool, then the heaviest remaining bags
+    if `balances` is passed — cluster % is a supply share, so dust snipers
+    first would miss the GI pattern.
+    """
+    if n <= 0 or not moves:
+        return []
+    pools = {p.lower() for p in pools if p}
+    ordered = sorted(moves, key=lambda m: m.block)
+    seen: set[str] = set()
+    pool_first: list[str] = []
+    for m in ordered:
+        to = m.to.lower()
+        if to in seen or to in pools or to == ZERO_ADDR:
+            continue
+        seen.add(to)
+        if m.frm.lower() in pools:
+            pool_first.append(to)
+    if balances:
+        pool_first.sort(key=lambda a: -float(balances.get(a, 0.0)))
+    return pool_first[:n]
+
+
+def cluster_share_by_root(
+    holders: list[Holder],
+    roots: dict[str, str],
+    circ_total: float,
+) -> float:
+    """Supply share of the largest group sharing a funding root (quote hops)."""
+    if circ_total <= 0 or not roots:
+        return 0.0
+    by_root: dict[str, float] = {}
+    for h in holders:
+        root = roots.get(h.address.lower())
+        if not root:
+            continue
+        by_root[root] = by_root.get(root, 0.0) + h.balance
+    if not by_root:
+        return 0.0
+    return max(by_root.values()) / circ_total
 
 
 def gini(values: list[float]) -> float:
@@ -205,6 +258,21 @@ def analyze(
 
     stats.largest_funding_cluster_pct = funding_cluster_share(circulating, circ_total)
     return stats
+
+
+def unmeasured_from_stats(stats: HolderStats) -> set[str]:
+    """Keys analyze() left at 0 because the input was missing, not because 0 is true.
+
+    Callers must keep these in Enrichment.unknown so normalize() zeros them
+    instead of treating the default as a clean launch / old wallets.
+    """
+    out: set[str] = set()
+    for note in stats.notes:
+        if "wallet ages unavailable" in note:
+            out.add("fresh_wallet_pct")
+        if "launch slot unknown" in note:
+            out.add("bundle_pct")
+    return out
 
 
 def funding_cluster_share(holders: list[Holder], circ_total: float) -> float:

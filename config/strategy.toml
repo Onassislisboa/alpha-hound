@@ -14,7 +14,9 @@ quote_seconds = 0.4
 # How often discovery runs and new candidates are scored.
 scan_seconds = 2.0
 # A candidate older than this is no longer an early signal, it is a chart.
-max_candidate_age_minutes = 180
+# 240 = 180 + 60: Hood still prints MFE≥20% in the last 30m of the old window
+# (150–180); one extra hour keeps those on the visor without opening 6h charts.
+max_candidate_age_minutes = 240
 # Hard cap on candidates fully enriched per tick, to bound RPC spend. Only
 # candidates that survive the free gates get here, so this is the real budget.
 # Hard cap on candidates fully enriched per tick. 0 = every scan card.
@@ -378,7 +380,7 @@ max_cluster_pct = 0.45
 
 [playbooks.robinhood_chain]
 # Dip, hold, runner. Don't chase a 5m rip; first take later so the bag can reprice.
-max_age_minutes = 180
+max_age_minutes = 240
 copy_max_age_minutes = 90
 copy_min_mcap_usd = 100000
 copy_max_mcap_usd = 2000000

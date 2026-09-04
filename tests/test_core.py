@@ -151,11 +151,58 @@ class TestDistribution(unittest.TestCase):
         self.assertGreater(stats.largest_funding_cluster_pct, 0.70)
         self.assertGreater(stats.bundle_pct, 0.70)
 
+    def test_quote_cluster_is_complementary_to_token_hops(self):
+        from alphahound.signals.distribution import (
+            TokenMove,
+            cluster_share_by_root,
+            first_pool_buyers,
+        )
+
+        pool = "0x" + "p" * 40
+        moves = [TokenMove(i, pool, f"0x{i:040x}", 10.0) for i in range(1, 6)]
+        buyers = first_pool_buyers(moves, {pool}, 40, {f"0x{i:040x}": 10.0 for i in range(1, 6)})
+        self.assertEqual(len(buyers), 5)
+        roots = {f"0x{i:040x}": "0x" + "f" * 40 for i in range(1, 5)}
+        holders = [Holder(f"0x{i:040x}", 10.0) for i in range(1, 6)]
+        # 4 of 5 bags share a quote root → 80%, which the token-hop path would miss.
+        self.assertAlmostEqual(cluster_share_by_root(holders, roots, 50.0), 0.8)
+
     def test_bundle_pct_not_reported_without_a_launch_slot(self):
         holders = [Holder("a", 100.0, acquired_slot=10)]
         stats = analyze(holders, now_ms=now_ms(), launch_slot=0)
         self.assertEqual(stats.bundle_pct, 0.0)
         self.assertTrue(any("launch slot" in note for note in stats.notes))
+        from alphahound.signals.distribution import unmeasured_from_stats
+
+        self.assertIn("bundle_pct", unmeasured_from_stats(stats))
+        self.assertIn("fresh_wallet_pct", unmeasured_from_stats(stats))
+
+    def test_wallet_ages_present_are_measured(self):
+        from alphahound.signals.distribution import unmeasured_from_stats
+
+        t = now_ms()
+        stats = analyze(
+            [Holder("a", 100.0, first_seen_ms=t, acquired_slot=1)],
+            now_ms=t,
+            launch_slot=1,
+        )
+        self.assertEqual(unmeasured_from_stats(stats), set())
+        self.assertAlmostEqual(stats.fresh_wallet_pct, 1.0)
+
+    def test_missing_fresh_wallet_age_is_score_neutral_not_a_bonus(self):
+        from alphahound.models import Features
+        from alphahound.scoring import Model, normalize
+
+        feat = Features(fresh_wallet_pct=0.0, bundle_pct=0.0)
+        model = Model()
+        _, lied = model.probability(normalize(feat, unknown=set()))
+        _, honest = model.probability(
+            normalize(feat, unknown={"fresh_wallet_pct", "bundle_pct"})
+        )
+        self.assertGreater(lied.get("fresh_wallet_pct", 0.0), 0.5)
+        self.assertNotIn("fresh_wallet_pct", honest)
+        self.assertGreater(lied.get("bundle_pct", 0.0), 0.3)
+        self.assertNotIn("bundle_pct", honest)
 
 
 class TestChart(unittest.TestCase):
@@ -1306,6 +1353,22 @@ class TestCrowd(unittest.TestCase):
         sized = crowd_read(holders, [], set(), size_pct=0.15)
         self.assertEqual(sized.inside, 2)
         self.assertAlmostEqual(sized.hold_pct, 0.90)
+
+    def test_fomo_supply_pct_is_a_score_prior_not_a_gate(self):
+        from alphahound.models import Features
+        from alphahound.scoring import PRIOR_WEIGHTS, normalize
+
+        self.assertIn("fomo_supply_pct", Features.names())
+        self.assertGreater(PRIOR_WEIGHTS["fomo_supply_pct"], PRIOR_WEIGHTS["fomo_inside"])
+        raw = normalize(Features(fomo_supply_pct=0.25), unknown=set())
+        missing = normalize(Features(fomo_supply_pct=0.25), unknown={"fomo_supply_pct"})
+        self.assertAlmostEqual(raw["fomo_supply_pct"], 0.25)
+        self.assertEqual(missing["fomo_supply_pct"], 0.0)
+        src = Path(__file__).resolve().parents[1] / "src" / "alphahound" / "scoring.py"
+        gates = src.read_text(encoding="utf-8")
+        # evaluate_gates lives in this file; the new feature must not be named there.
+        gate_fn = gates[gates.index("def evaluate_gates") : gates.index("def patience_only")]
+        self.assertNotIn("fomo_supply_pct", gate_fn)
 
     def test_who_inside_names_labeled_kols(self):
         from alphahound.signals.distribution import Holder
